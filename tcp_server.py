@@ -411,7 +411,7 @@ class TCPServer:
                         else:
                             conn.send(b'ERROR:Invalid FOLDER_START command')
 
-                    elif data.startswith('FILE_REL'):
+                    elif data.startswith('REL_FILE'):
                         # This is handled within handle_folder_transfer
                         # But we need to acknowledge it
                         conn.send(b'READY')
@@ -510,8 +510,8 @@ class TCPServer:
                 # Receive next command
                 data = conn.recv(1024).decode().strip()
                 
-                if data.startswith('FILE_REL'):
-                    # Format: FILE_REL <relative_path> <size> <checksum>
+                if data.startswith('REL_FILE'):
+                    # Format: REL_FILE <relative_path> <size> <checksum>
                     parts = data.split()
                     if len(parts) == 4:
                         _, rel_path, size, checksum = parts
@@ -533,7 +533,7 @@ class TCPServer:
                             conn.send(f'FILE_FAIL {message}'.encode())
                             return False, f"File {rel_path} failed"
                     else:
-                        conn.send(b'ERROR:Invalid FILE_REL command')
+                        conn.send(b'ERROR:Invalid REL_FILE command')
                         return False, "Invalid command"
                 
                 elif data.startswith('FOLDER_END'):

@@ -354,7 +354,7 @@ class TCPClient:
             checksum_hex = file_checksum.hexdigest()
             
             # Send file metadata with RELATIVE path
-            file_cmd = f"FILE_REL {rel_path} {file_size} {checksum_hex}"
+            file_cmd = f"REL_FILE {rel_path} {file_size} {checksum_hex}"
             self.sock.send(file_cmd.encode())
             
             # Wait for READY
