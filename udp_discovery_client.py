@@ -29,10 +29,12 @@ class UDPDiscoveryClient:
             self.sock.settimeout(self.timeout)
             
             discovery_msg = "LFTP_DISCOVERY"
-            broadcast_addr = ('255.255.255.255', UDP_PORT)
+            broadcast_addr = ('192.168.0.255', UDP_PORT)
             
             logging.info("Sending broadcast request...")
-            self.sock.sendto(discovery_msg.encode(), broadcast_addr)
+            for i in range(4):
+                self.sock.sendto(discovery_msg.encode(), broadcast_addr)
+                time.sleep(0.5 if i < 3 else 0)  # Không sleep lần cuối
             
             start_time = time.time()
             while time.time() - start_time < self.timeout:

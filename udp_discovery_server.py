@@ -18,15 +18,27 @@ class UDPDiscoveryServer:
         self.sock = None
         
     def get_local_ip(self):
-        """Получает локальный IP адрес"""
+        """Получает локальный IP адрес более надежно"""
         try:
+            # Tạo socket tạm và bind vào 0.0.0.0
             temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            temp_sock.connect(("8.8.8.8", 80))
+            temp_sock.bind(('0.0.0.0', 0))  # bind bất kỳ port nào
+            # Lấy IP từ socket name (cách tốt hơn khi có nhiều NIC/VM)
             ip = temp_sock.getsockname()[0]
             temp_sock.close()
+            if ip.startswith('127.'):
+                return "127.0.0.1"
             return ip
-        except:
-            return "127.0.0.1"
+        except Exception:
+            try:
+                # Fallback cũ
+                temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                temp_sock.connect(("8.8.8.8", 80))
+                ip = temp_sock.getsockname()[0]
+                temp_sock.close()
+                return ip
+            except:
+                return "127.0.0.1"
     
     def start(self):
         """Запускает UDP сервер обнаружения"""
