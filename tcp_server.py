@@ -8,8 +8,11 @@ import json
 import hashlib
 import os
 import logging
-from datetime import datetime
-from config import TCP_PORT, MAX_FILE_SIZE, UPLOAD_DIR
+import shutil
+import datetime
+from config import TCP_PORT, UDP_DATA_PORT, MAX_FILE_SIZE, UPLOAD_DIR
+import jwt
+from config import JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRATION_HOURS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +25,7 @@ class TCPServer:
         self.port = port
         self.running = False
         self.server_socket = None
+        self.udp_socket = None
         self.clients = []
         
         # Загружаем базу пользователей
@@ -51,6 +55,16 @@ class TCPServer:
             logging.error(f"Error loading users: {e}")
             return {}
     
+    def verify_jwt(self, token):
+        """Verifies JWT token and returns user info"""
+        try:
+            payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            return payload
+        except jwt.ExpiredSignatureError:
+            return None  # Token expired
+        except jwt.InvalidTokenError:
+            return None  # Invalid token
+    
     def authenticate(self, conn, addr):
         """Выполняет аутентификацию клиента"""
         try:
@@ -71,8 +85,17 @@ class TCPServer:
             if username in self.users:
                 stored_hash = self.users[username]
                 if stored_hash == password_hash:
+                    # Generate JWT token
+                    expiration = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=JWT_EXPIRATION_HOURS)
+                    token_payload = {
+                        'username': username,
+                        'is_admin': (username == 'admin'),
+                        'exp': int(expiration.timestamp())
+                    }
+                    token = jwt.encode(token_payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+                    
+                    conn.send(f'AUTH_OK {token}'.encode())
                     logging.info(f"User {username} authenticated from {addr[0]}")
-                    conn.send(b'AUTH_OK')
                     return True, username
                 else:
                     conn.send(b'AUTH_FAIL:Wrong password')
@@ -85,7 +108,7 @@ class TCPServer:
             logging.error(f"Authentication error: {e}")
             return False, str(e)
         
-    def receive_streaming_file(self, conn, filename, expected_size):
+    def receive_streaming_file(self, conn, client_ip, filename, expected_size):
         """
         Прием больших файлов потоковым способом
         """
@@ -284,7 +307,7 @@ class TCPServer:
         except Exception as e:
             logging.error(f"Large file receive error: {e}")
             return False, str(e)    
-    def receive_file(self, conn, filename, expected_size, expected_checksum):
+    def receive_file(self, conn, client_ip, filename, expected_size, expected_checksum):
         """Принимает файл и проверяет целостность"""
         try:
             file_path = os.path.join(UPLOAD_DIR, filename)
@@ -300,18 +323,24 @@ class TCPServer:
             conn.send(b'READY')
             logging.info(f"Receiving file: {filename} ({expected_size} bytes)")
             
-            # Принимаем данные
+            # Принимаем данные через UDP
             received_data = b''
             bytes_received = 0
             chunk_size = 4096
+            self.udp_socket.settimeout(10)  # Timeout for UDP receive
             
             while bytes_received < int(expected_size):
-                remaining = int(expected_size) - bytes_received
-                chunk = conn.recv(min(chunk_size, remaining))
-                if not chunk:
+                try:
+                    data, addr = self.udp_socket.recvfrom(chunk_size)
+                    if addr[0] != client_ip:
+                        continue  # Ignore data from other clients
+                    received_data += data
+                    bytes_received += len(data)
+                    # Send ACK via TCP
+                    conn.send(f'ACK {bytes_received}'.encode())
+                except socket.timeout:
+                    logging.error("UDP receive timeout")
                     break
-                received_data += chunk
-                bytes_received += len(chunk)
             
             # Проверяем целостность
             actual_checksum = hashlib.sha256(received_data).hexdigest()
@@ -326,7 +355,7 @@ class TCPServer:
                     'original_name': filename,
                     'size': bytes_received,
                     'checksum': actual_checksum,
-                    'received_at': datetime.now().isoformat()
+                    'received_at': datetime.datetime.now().isoformat()
                 }
                 
                 meta_path = file_path + '.meta'
@@ -363,34 +392,57 @@ class TCPServer:
             
             username = auth_message
             
-            # Основной цикл обработки команд
+            # Send UDP data port to client
+            conn.send(f'UDP_PORT {UDP_DATA_PORT}'.encode())
+            logging.info(f"Sent UDP data port {UDP_DATA_PORT} to {client_id}")
+            
+            # Основной цикл обработки команд с JWT
             while True:
                 try:
-                    # Получаем команду
+                    # Получаем команду с токеном
                     data = conn.recv(1024).decode().strip()
                     if not data:
                         break
                     
-                    logging.info(f"Command from {username}: {data[:50]}...")
+                    # Ожидаем формат: TOKEN <jwt_token> <command>
+                    parts = data.split(maxsplit=2)
+                    if len(parts) < 2 or parts[0] != 'TOKEN':
+                        conn.send(b'ERROR:Invalid command format. Expected: TOKEN <jwt> <command>')
+                        continue
+                    
+                    jwt_token = parts[1]
+                    command = parts[2] if len(parts) > 2 else ''
+                    
+                    # Верифицируем JWT
+                    token_payload = self.verify_jwt(jwt_token)
+                    if not token_payload:
+                        conn.send(b'ERROR:Invalid or expired token')
+                        logging.warning(f"Invalid JWT token from {client_id}")
+                        continue
+                    
+                    username = token_payload['username']
+                    is_admin = token_payload.get('is_admin', False)
+                    
+                    logging.info(f"Command from {username}: {command[:50]}...")
 
-                    if data.startswith('FILE'):
+                    if command.startswith('FILE'):
                         # Формат: FILE <filename> <size> <checksum>
-                        parts = data.split()
-                        if len(parts) == 4:
-                            _, filename, size, checksum = parts
-                            success, message = self.receive_file(conn, filename, size, checksum)
+                        cmd_parts = command.split()
+                        if len(cmd_parts) == 4:
+                            _, filename, size, checksum = cmd_parts
+                            success, message = self.receive_file(conn, addr[0], filename, size, checksum)
                             if success:
                                 logging.info(f"File from {username} processed: {message}")
                             else:
                                 logging.error(f"File processing error from {username}: {message}")
                         else:
                             conn.send(b'ERROR:Invalid FILE command format')
-                    elif data.startswith('STREAM_FILE'):
+                    elif command.startswith('STREAM_FILE'):
                         # Формат: STREAM_FILE <filename> <size>
-                        parts = data.split()
-                        if len(parts) == 3:
-                            _, filename, size = parts
-                            success, message = self.receive_streaming_file(conn, filename, size)
+                        cmd_parts = command.split()
+                        if len(cmd_parts) == 3:
+                            _, filename, size = cmd_parts
+                            success, message = self.receive_streaming_file(conn, addr[0], filename, size)
                             if success:
                                 logging.info(f"Streaming file from {username} processed: {message}")
                             else:
@@ -398,11 +450,11 @@ class TCPServer:
                         else:
                             conn.send(b'ERROR:Invalid STREAM_FILE command format')
 
-                    elif data.startswith('FOLDER_START'):
+                    elif command.startswith('FOLDER_START'):
                         # Format: FOLDER_START <folder_name> <file_count>
-                        parts = data.split()
-                        if len(parts) == 3:
-                            _, folder_name, file_count = parts
+                        cmd_parts = command.split()
+                        if len(cmd_parts) == 3:
+                            _, folder_name, file_count = cmd_parts
                             success, message = self.handle_folder_transfer(conn, folder_name, file_count)
                             if success:
                                 logging.info(f"Folder from {username} received: {message}")
@@ -411,16 +463,126 @@ class TCPServer:
                         else:
                             conn.send(b'ERROR:Invalid FOLDER_START command')
 
-                    elif data.startswith('REL_FILE'):
+                    elif command.startswith('REL_FILE'):
                         # This is handled within handle_folder_transfer
                         # But we need to acknowledge it
                         conn.send(b'READY')
 
-                    elif data == 'FOLDER_END':
+                    elif command == 'FOLDER_END':
                         # This is handled within receive_folder
                         pass
                     
-                    elif data == 'QUIT':
+                    elif command == 'LIST_FILES':
+                        # List all files and folders in uploads directory
+                        success, message = self.list_files(conn)
+                        if success:
+                            logging.info(f"File list sent to {username}")
+                        else:
+                            logging.error(f"List files error: {message}")
+                    
+                    elif command.startswith('DOWNLOAD_FILE'):
+                        # Format: DOWNLOAD_FILE <filename>
+                        cmd_parts = command.split()
+                        if len(cmd_parts) == 2:
+                            _, filename = cmd_parts
+                            success, message = self.send_file_to_client(conn, filename)
+                            if success:
+                                logging.info(f"File {filename} sent to {username}: {message}")
+                            else:
+                                logging.error(f"File send error to {username}: {message}")
+                        else:
+                            conn.send(b'ERROR:Invalid DOWNLOAD_FILE command format')
+                    
+                    elif command.startswith('DOWNLOAD_FOLDER'):
+                        # Format: DOWNLOAD_FOLDER <folder_name>
+                        cmd_parts = command.split()
+                        if len(cmd_parts) == 2:
+                            _, folder_name = cmd_parts
+                            success, message = self.send_folder_to_client(conn, folder_name)
+                            if success:
+                                logging.info(f"Folder {folder_name} sent to {username}: {message}")
+                            else:
+                                logging.error(f"Folder send error to {username}: {message}")
+                        else:
+                            conn.send(b'ERROR:Invalid DOWNLOAD_FOLDER command format')
+                    
+                    elif command.startswith('DELETE_FILE'):
+                        # Format: DELETE_FILE <filename>
+                        if not is_admin:
+                            conn.send(b'ERROR:Permission denied. Admin only.')
+                            logging.warning(f"User {username} attempted to delete file (admin only)")
+                        else:
+                            cmd_parts = command.split()
+                            if len(cmd_parts) == 2:
+                                _, filename = cmd_parts
+                                success, message = self.delete_file(filename)
+                                if success:
+                                    logging.info(f"File {filename} deleted by {username}: {message}")
+                                    conn.send(f'DELETE_OK {message}'.encode())
+                                else:
+                                    logging.error(f"Delete file error: {message}")
+                                    conn.send(f'DELETE_FAIL {message}'.encode())
+                            else:
+                                conn.send(b'ERROR:Invalid DELETE_FILE command format')
+                    
+                    elif command.startswith('DELETE_FOLDER'):
+                        # Format: DELETE_FOLDER <folder_name>
+                        if not is_admin:
+                            conn.send(b'ERROR:Permission denied. Admin only.')
+                            logging.warning(f"User {username} attempted to delete folder (admin only)")
+                        else:
+                            cmd_parts = command.split()
+                            if len(cmd_parts) == 2:
+                                _, folder_name = cmd_parts
+                                success, message = self.delete_folder(folder_name)
+                                if success:
+                                    logging.info(f"Folder {folder_name} deleted by {username}: {message}")
+                                    conn.send(f'DELETE_OK {message}'.encode())
+                                else:
+                                    logging.error(f"Delete folder error: {message}")
+                                    conn.send(f'DELETE_FAIL {message}'.encode())
+                            else:
+                                conn.send(b'ERROR:Invalid DELETE_FOLDER command format')
+                    
+                    elif command.startswith('RENAME_FILE'):
+                        # Format: RENAME_FILE <old_name> <new_name>
+                        if not is_admin:
+                            conn.send(b'ERROR:Permission denied. Admin only.')
+                            logging.warning(f"User {username} attempted to rename file (admin only)")
+                        else:
+                            cmd_parts = command.split(maxsplit=2)
+                            if len(cmd_parts) == 3:
+                                _, old_name, new_name = cmd_parts
+                                success, message = self.rename_file(old_name, new_name)
+                                if success:
+                                    logging.info(f"File {old_name} renamed to {new_name} by {username}: {message}")
+                                    conn.send(f'RENAME_OK {message}'.encode())
+                                else:
+                                    logging.error(f"Rename file error: {message}")
+                                    conn.send(f'RENAME_FAIL {message}'.encode())
+                            else:
+                                conn.send(b'ERROR:Invalid RENAME_FILE command format')
+                    
+                    elif command.startswith('RENAME_FOLDER'):
+                        # Format: RENAME_FOLDER <old_name> <new_name>
+                        if not is_admin:
+                            conn.send(b'ERROR:Permission denied. Admin only.')
+                            logging.warning(f"User {username} attempted to rename folder (admin only)")
+                        else:
+                            cmd_parts = command.split(maxsplit=2)
+                            if len(cmd_parts) == 3:
+                                _, old_name, new_name = cmd_parts
+                                success, message = self.rename_folder(old_name, new_name)
+                                if success:
+                                    logging.info(f"Folder {old_name} renamed to {new_name} by {username}: {message}")
+                                    conn.send(f'RENAME_OK {message}'.encode())
+                                else:
+                                    logging.error(f"Rename folder error: {message}")
+                                    conn.send(f'RENAME_FAIL {message}'.encode())
+                            else:
+                                conn.send(b'ERROR:Invalid RENAME_FOLDER command format')
+                    
+                    elif command == 'QUIT':
                         conn.send(b'GOODBYE')
                         break
                     
@@ -451,6 +613,12 @@ class TCPServer:
         self.running = True
         
         try:
+            # Initialize UDP socket for data transfer
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.udp_socket.bind(('0.0.0.0', UDP_DATA_PORT))
+            logging.info(f"UDP Data Server started on port {UDP_DATA_PORT}")
+            
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind(('0.0.0.0', self.port))
@@ -584,6 +752,325 @@ class TCPServer:
                 
         except Exception as e:
             logging.error(f"Error receiving file {file_path}: {e}")
+            return False, str(e)
+    
+    def list_files(self, conn):
+        """Lists all files and folders in the uploads directory"""
+        try:
+            files_list = []
+            folders_list = []
+            
+            if not os.path.exists(UPLOAD_DIR):
+                conn.send(b'LIST_EMPTY')
+                return True, "Upload directory is empty"
+            
+            # Scan for files and folders
+            for item in os.listdir(UPLOAD_DIR):
+                item_path = os.path.join(UPLOAD_DIR, item)
+                
+                # Skip metadata files
+                if item.endswith('.meta') or item.endswith('.corrupted'):
+                    continue
+                
+                if os.path.isfile(item_path):
+                    file_size = os.path.getsize(item_path)
+                    files_list.append({
+                        'name': item,
+                        'type': 'file',
+                        'size': file_size
+                    })
+                elif os.path.isdir(item_path):
+                    # Count files in folder
+                    file_count = sum(1 for root, dirs, files in os.walk(item_path) 
+                                   for f in files if not f.endswith('.meta'))
+                    folders_list.append({
+                        'name': item,
+                        'type': 'folder',
+                        'file_count': file_count
+                    })
+            
+            # Send list
+            list_data = {
+                'files': files_list,
+                'folders': folders_list
+            }
+            
+            list_json = json.dumps(list_data)
+            list_size = len(list_json.encode())
+            
+            # Send: LIST_START <size>
+            conn.send(f'LIST_START {list_size}'.encode())
+            
+            # Wait for READY
+            response = conn.recv(1024).decode().strip()
+            if response != 'READY':
+                return False, f"Client not ready: {response}"
+            
+            # Send the list
+            conn.sendall(list_json.encode())
+            
+            # Wait for confirmation
+            confirm = conn.recv(1024).decode().strip()
+            if confirm.startswith('LIST_OK'):
+                return True, f"List sent: {len(files_list)} files, {len(folders_list)} folders"
+            else:
+                return False, f"List send failed: {confirm}"
+                
+        except Exception as e:
+            logging.error(f"List files error: {e}")
+            return False, str(e)
+    
+    def send_file_to_client(self, conn, filename):
+        """Sends a file to the client"""
+        try:
+            file_path = os.path.join(UPLOAD_DIR, filename)
+            
+            if not os.path.exists(file_path):
+                conn.send(b'FILE_NOT_FOUND')
+                return False, f"File not found: {filename}"
+            
+            if not os.path.isfile(file_path):
+                conn.send(b'NOT_A_FILE')
+                return False, f"Not a file: {filename}"
+            
+            file_size = os.path.getsize(file_path)
+            
+            # Calculate checksum
+            logging.info(f"Calculating checksum for {filename}...")
+            file_hash = hashlib.sha256()
+            with open(file_path, 'rb') as f:
+                while chunk := f.read(8192):
+                    file_hash.update(chunk)
+            checksum = file_hash.hexdigest()
+            
+            # Send file info: FILE_INFO <filename> <size> <checksum>
+            file_info = f'FILE_INFO {filename} {file_size} {checksum}'
+            conn.send(file_info.encode())
+            
+            # Wait for READY
+            response = conn.recv(1024).decode().strip()
+            if response != 'READY':
+                return False, f"Client not ready: {response}"
+            
+            # Send file data
+            logging.info(f"Sending file {filename} ({file_size:,} bytes) to client")
+            bytes_sent = 0
+            
+            with open(file_path, 'rb') as f:
+                while bytes_sent < file_size:
+                    chunk = f.read(65536)  # 64KB chunks
+                    if not chunk:
+                        break
+                    conn.sendall(chunk)
+                    bytes_sent += len(chunk)
+            
+            # Wait for confirmation
+            result = conn.recv(1024).decode().strip()
+            if result.startswith('FILE_RECEIVED'):
+                return True, f"File sent: {bytes_sent:,} bytes"
+            else:
+                return False, f"Transfer failed: {result}"
+                
+        except Exception as e:
+            logging.error(f"Send file error: {e}")
+            return False, str(e)
+    
+    def send_folder_to_client(self, conn, folder_name):
+        """Sends a folder to the client"""
+        try:
+            folder_path = os.path.join(UPLOAD_DIR, folder_name)
+            
+            if not os.path.exists(folder_path):
+                conn.send(b'FOLDER_NOT_FOUND')
+                return False, f"Folder not found: {folder_name}"
+            
+            if not os.path.isdir(folder_path):
+                conn.send(b'NOT_A_FOLDER')
+                return False, f"Not a folder: {folder_name}"
+            
+            # Get all files recursively
+            all_files = []
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    # Skip metadata files
+                    if file.endswith('.meta') or file.endswith('.corrupted'):
+                        continue
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, folder_path)
+                    all_files.append((full_path, rel_path))
+            
+            if not all_files:
+                conn.send(b'FOLDER_EMPTY')
+                return False, "Folder is empty"
+            
+            # Send folder info: FOLDER_INFO <folder_name> <file_count>
+            folder_info = f'FOLDER_INFO {folder_name} {len(all_files)}'
+            conn.send(folder_info.encode())
+            
+            # Wait for READY
+            response = conn.recv(1024).decode().strip()
+            if response != 'FOLDER_READY':
+                return False, f"Client not ready: {response}"
+            
+            # Send each file
+            files_sent = 0
+            total_size = 0
+            
+            for full_path, rel_path in all_files:
+                try:
+                    file_size = os.path.getsize(full_path)
+                    
+                    # Calculate checksum
+                    file_hash = hashlib.sha256()
+                    with open(full_path, 'rb') as f:
+                        while chunk := f.read(8192):
+                            file_hash.update(chunk)
+                    checksum = file_hash.hexdigest()
+                    
+                    # Send file info: REL_FILE_INFO <relative_path> <size> <checksum>
+                    file_info = f'REL_FILE_INFO {rel_path} {file_size} {checksum}'
+                    conn.send(file_info.encode())
+                    
+                    # Wait for READY
+                    response = conn.recv(1024).decode().strip()
+                    if response != 'READY':
+                        return False, f"Client not ready for {rel_path}: {response}"
+                    
+                    # Send file data
+                    bytes_sent = 0
+                    with open(full_path, 'rb') as f:
+                        while bytes_sent < file_size:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            conn.sendall(chunk)
+                            bytes_sent += len(chunk)
+                    
+                    # Wait for confirmation
+                    result = conn.recv(1024).decode().strip()
+                    if result.startswith('FILE_RECEIVED'):
+                        files_sent += 1
+                        total_size += file_size
+                        logging.info(f"Sent file {files_sent}/{len(all_files)}: {rel_path}")
+                    else:
+                        return False, f"File transfer failed: {rel_path} - {result}"
+                        
+                except Exception as e:
+                    logging.error(f"Error sending file {rel_path}: {e}")
+                    return False, f"Error sending {rel_path}: {e}"
+            
+            # Send folder completion
+            conn.send(f'FOLDER_COMPLETE {files_sent} files sent'.encode())
+            
+            # Wait for final confirmation
+            final_response = conn.recv(1024).decode().strip()
+            if final_response.startswith('FOLDER_RECEIVED'):
+                return True, f"Folder sent: {files_sent} files, {total_size:,} bytes"
+            else:
+                return False, f"Folder transfer incomplete: {final_response}"
+                
+        except Exception as e:
+            logging.error(f"Send folder error: {e}")
+            return False, str(e)
+    
+    def delete_file(self, filename):
+        """Deletes a file from the uploads directory"""
+        try:
+            file_path = os.path.join(UPLOAD_DIR, filename)
+            
+            if not os.path.exists(file_path):
+                return False, f"File not found: {filename}"
+            
+            if not os.path.isfile(file_path):
+                return False, f"Not a file: {filename}"
+            
+            # Also delete metadata file if exists
+            meta_path = file_path + '.meta'
+            if os.path.exists(meta_path):
+                os.remove(meta_path)
+            
+            os.remove(file_path)
+            logging.info(f"File deleted: {filename}")
+            return True, f"File deleted: {filename}"
+            
+        except Exception as e:
+            logging.error(f"Delete file error: {e}")
+            return False, str(e)
+    
+    def delete_folder(self, folder_name):
+        """Deletes a folder from the uploads directory"""
+        try:
+            folder_path = os.path.join(UPLOAD_DIR, folder_name)
+            
+            if not os.path.exists(folder_path):
+                return False, f"Folder not found: {folder_name}"
+            
+            if not os.path.isdir(folder_path):
+                return False, f"Not a folder: {folder_name}"
+            
+            # Use shutil to remove directory tree
+            shutil.rmtree(folder_path)
+            logging.info(f"Folder deleted: {folder_name}")
+            return True, f"Folder deleted: {folder_name}"
+            
+        except Exception as e:
+            logging.error(f"Delete folder error: {e}")
+            return False, str(e)
+    
+    def rename_file(self, old_name, new_name):
+        """Renames a file in the uploads directory"""
+        try:
+            old_path = os.path.join(UPLOAD_DIR, old_name)
+            new_path = os.path.join(UPLOAD_DIR, new_name)
+            
+            if not os.path.exists(old_path):
+                return False, f"File not found: {old_name}"
+            
+            if not os.path.isfile(old_path):
+                return False, f"Not a file: {old_name}"
+            
+            if os.path.exists(new_path):
+                return False, f"File already exists: {new_name}"
+            
+            # Rename file
+            os.rename(old_path, new_path)
+            
+            # Rename metadata file if exists
+            old_meta = old_path + '.meta'
+            new_meta = new_path + '.meta'
+            if os.path.exists(old_meta):
+                os.rename(old_meta, new_meta)
+            
+            logging.info(f"File renamed: {old_name} -> {new_name}")
+            return True, f"File renamed: {old_name} -> {new_name}"
+            
+        except Exception as e:
+            logging.error(f"Rename file error: {e}")
+            return False, str(e)
+    
+    def rename_folder(self, old_name, new_name):
+        """Renames a folder in the uploads directory"""
+        try:
+            old_path = os.path.join(UPLOAD_DIR, old_name)
+            new_path = os.path.join(UPLOAD_DIR, new_name)
+            
+            if not os.path.exists(old_path):
+                return False, f"Folder not found: {old_name}"
+            
+            if not os.path.isdir(old_path):
+                return False, f"Not a folder: {old_name}"
+            
+            if os.path.exists(new_path):
+                return False, f"Folder already exists: {new_name}"
+            
+            # Rename folder
+            os.rename(old_path, new_path)
+            
+            logging.info(f"Folder renamed: {old_name} -> {new_name}")
+            return True, f"Folder renamed: {old_name} -> {new_name}"
+            
+        except Exception as e:
+            logging.error(f"Rename folder error: {e}")
             return False, str(e)
 
 if __name__ == "__main__":

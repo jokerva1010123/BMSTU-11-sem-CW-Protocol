@@ -5,9 +5,10 @@ Configuration - Конфигурация проекта LFTP
 
 # Network settings
 UDP_PORT = 9434           # Port for UDP discovery
+UDP_DATA_PORT = 9436      # Port for UDP data transfer
 TCP_PORT = 9435           # Port for TCP transfer
 DISCOVERY_TIMEOUT = 5     # Discovery timeout in seconds
-MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024  # Maximum file size (100 MB)
+MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024  # Maximum file size (100 MB)
 LARGE_FILE_THRESHOLD =  100 * 1024 * 1024
 
 # Transfer settings
@@ -26,6 +27,11 @@ MAX_CLIENTS = 10          # Maximum concurrent clients
 REQUIRE_AUTHENTICATION = True
 ALLOW_ANONYMOUS = False
 SESSION_TIMEOUT = 300     # Session timeout in seconds
+
+# JWT settings
+JWT_SECRET_KEY = "your-secret-key-change-this-in-production"  # Change this to a secure key
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24  # Token expires in 24 hours
 
 # Integrity settings
 CHECKSUM_ALGORITHM = "sha256"  # sha256 or md5

@@ -7,7 +7,8 @@ import os
 import hashlib
 import time
 import logging
-from config import TCP_PORT, CHUNK_SIZE
+import json
+from config import TCP_PORT, UDP_DATA_PORT, CHUNK_SIZE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,8 +20,11 @@ class TCPClient:
         self.server_ip = server_ip
         self.server_port = server_port
         self.sock = None
+        self.udp_sock = None
+        self.udp_data_port = None
         self.authenticated = False
         self.username = None
+        self.jwt_token = None
     
     def connect(self):
         """Устанавливает соединение с сервером"""
@@ -53,9 +57,25 @@ class TCPClient:
             # Получаем ответ
             auth_response = self.sock.recv(1024).decode()
             
-            if auth_response == 'AUTH_OK':
+            if auth_response.startswith('AUTH_OK'):
+                # Parse JWT token
+                parts = auth_response.split()
+                if len(parts) >= 2:
+                    self.jwt_token = parts[1]
                 self.authenticated = True
                 self.username = username
+                
+                # Receive UDP data port
+                udp_port_msg = self.sock.recv(1024).decode().strip()
+                if udp_port_msg.startswith('UDP_PORT'):
+                    self.udp_data_port = int(udp_port_msg.split()[1])
+                    # Initialize UDP socket
+                    self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    logging.info(f"UDP data port: {self.udp_data_port}")
+                else:
+                    logging.error("Did not receive UDP port")
+                    return False
+                
                 logging.info(f"Authentication successful: {username}")
                 return True
             else:
@@ -65,6 +85,19 @@ class TCPClient:
         except Exception as e:
             logging.error(f"Authentication error: {e}")
             return False
+    
+    def _send_command(self, command):
+        """Отправляет команду с JWT токеном"""
+        if not self.authenticated or not self.jwt_token:
+            return False, "Not authenticated"
+        
+        try:
+            full_command = f"TOKEN {self.jwt_token} {command}"
+            self.sock.send(full_command.encode())
+            return True, None
+        except Exception as e:
+            logging.error(f"Error sending command: {e}")
+            return False, str(e)
         
     def send_large_file(self, file_path, progress_callback=None):
         """
@@ -84,7 +117,9 @@ class TCPClient:
             
             # Шаг 1: Отправляем команду начала потоковой передачи
             file_cmd = f"STREAM_FILE {filename} {file_size}"
-            self.sock.send(file_cmd.encode())
+            success, error = self._send_command(file_cmd)
+            if not success:
+                return False, error
             
             # Ждем подтверждения (с таймаутом)
             self.sock.settimeout(10.0)
@@ -222,7 +257,9 @@ class TCPClient:
             
             # Отправляем метаданные
             file_cmd = f"FILE {filename} {file_size} {checksum_hex}"
-            self.sock.send(file_cmd.encode())
+            success, error = self._send_command(file_cmd)
+            if not success:
+                return False, error
             
             # Ждем подтверждения от сервера
             response = self.sock.recv(1024).decode()
@@ -241,8 +278,17 @@ class TCPClient:
                     if not chunk:
                         break
                     
-                    self.sock.sendall(chunk)
+                    self.udp_sock.sendto(chunk, (self.server_ip, self.udp_data_port))
                     bytes_sent += len(chunk)
+                    
+                    # Receive ACK from TCP
+                    try:
+                        ack = self.sock.recv(1024).decode().strip()
+                        if ack.startswith('ACK'):
+                            ack_bytes = int(ack.split()[1])
+                            # Optional: check if ack_bytes == bytes_sent
+                    except:
+                        pass  # For now, ignore
                     
                     # Вызываем callback для обновления прогресса
                     if progress_callback:
@@ -297,7 +343,9 @@ class TCPClient:
             
             # First, send FOLDER_START command
             folder_start_cmd = f"FOLDER_START {folder_name} {len(all_files)}"
-            self.sock.send(folder_start_cmd.encode())
+            success, error = self._send_command(folder_start_cmd)
+            if not success:
+                return False, error
             
             # Wait for server acknowledgement
             response = self.sock.recv(1024).decode()
@@ -390,6 +438,396 @@ class TCPClient:
         except Exception as e:
             return False, str(e)
     
+    def list_files(self):
+        """Requests and receives list of files and folders from server"""
+        if not self.authenticated:
+            return False, "Authentication required", None
+        
+        try:
+            # Send LIST_FILES command
+            success, error = self._send_command('LIST_FILES')
+            if not success:
+                return False, error, None
+            
+            # Receive response
+            response = self.sock.recv(1024).decode().strip()
+            
+            if response == 'LIST_EMPTY':
+                return True, "No files on server", {'files': [], 'folders': []}
+            
+            if not response.startswith('LIST_START'):
+                return False, f"Invalid response: {response}", None
+            
+            # Parse list size
+            parts = response.split()
+            if len(parts) != 2:
+                return False, "Invalid LIST_START format", None
+            
+            list_size = int(parts[1])
+            
+            # Send READY
+            self.sock.send(b'READY')
+            
+            # Receive list data
+            list_data = b''
+            while len(list_data) < list_size:
+                chunk = self.sock.recv(min(65536, list_size - len(list_data)))
+                if not chunk:
+                    break
+                list_data += chunk
+            
+            # Parse JSON
+            files_list = json.loads(list_data.decode())
+            
+            # Send confirmation
+            self.sock.send(b'LIST_OK')
+            
+            return True, f"List received: {len(files_list.get('files', []))} files, {len(files_list.get('folders', []))} folders", files_list
+            
+        except Exception as e:
+            logging.error(f"List files error: {e}")
+            return False, str(e), None
+    
+    def download_file(self, filename, save_path=None, progress_callback=None):
+        """Downloads a file from the server"""
+        if not self.authenticated:
+            return False, "Authentication required"
+        
+        try:
+            # Send DOWNLOAD_FILE command
+            download_cmd = f'DOWNLOAD_FILE {filename}'
+            success, error = self._send_command(download_cmd)
+            if not success:
+                return False, error
+            
+            # Receive response
+            response = self.sock.recv(1024).decode().strip()
+            
+            if response == 'FILE_NOT_FOUND':
+                return False, f"File not found on server: {filename}"
+            
+            if response == 'NOT_A_FILE':
+                return False, f"Not a file: {filename}"
+            
+            if not response.startswith('FILE_INFO'):
+                return False, f"Invalid response: {response}"
+            
+            # Parse file info: FILE_INFO <filename> <size> <checksum>
+            parts = response.split()
+            if len(parts) != 4:
+                return False, "Invalid FILE_INFO format"
+            
+            _, server_filename, file_size_str, expected_checksum = parts
+            file_size = int(file_size_str)
+            
+            # Determine save path
+            if save_path is None:
+                save_path = os.path.basename(server_filename)
+            
+            # Create directory if needed
+            save_dir = os.path.dirname(save_path)
+            if save_dir and not os.path.exists(save_dir):
+                os.makedirs(save_dir, exist_ok=True)
+            
+            # Handle duplicate filenames
+            counter = 1
+            original_path = save_path
+            name, ext = os.path.splitext(save_path)
+            while os.path.exists(save_path):
+                save_path = f"{name}_{counter}{ext}"
+                counter += 1
+            
+            # Send READY
+            self.sock.send(b'READY')
+            
+            # Receive file data
+            logging.info(f"Downloading {filename} ({file_size:,} bytes)...")
+            bytes_received = 0
+            file_hash = hashlib.sha256()
+            start_time = time.time()
+            
+            with open(save_path, 'wb') as f:
+                while bytes_received < file_size:
+                    remaining = file_size - bytes_received
+                    chunk = self.sock.recv(min(65536, remaining))
+                    if not chunk:
+                        break
+                    
+                    f.write(chunk)
+                    file_hash.update(chunk)
+                    bytes_received += len(chunk)
+                    
+                    # Update progress
+                    if progress_callback:
+                        progress = (bytes_received / file_size) * 100
+                        progress_callback(progress, bytes_received, file_size)
+            
+            # Verify checksum
+            actual_checksum = file_hash.hexdigest()
+            
+            if actual_checksum == expected_checksum:
+                # Send confirmation
+                self.sock.send(b'FILE_RECEIVED')
+                
+                transfer_time = time.time() - start_time
+                speed = file_size / transfer_time / (1024 * 1024) if transfer_time > 0 else 0
+                
+                return True, f"File downloaded: {save_path} ({speed:.2f} MB/s)"
+            else:
+                os.remove(save_path)
+                return False, f"Checksum mismatch. Expected: {expected_checksum[:16]}..., Got: {actual_checksum[:16]}..."
+                
+        except Exception as e:
+            logging.error(f"Download file error: {e}")
+            if 'save_path' in locals() and os.path.exists(save_path):
+                os.remove(save_path)
+            return False, str(e)
+    
+    def download_folder(self, folder_name, save_path=None, progress_callback=None):
+        """Downloads a folder from the server"""
+        if not self.authenticated:
+            return False, "Authentication required"
+        
+        try:
+            # Send DOWNLOAD_FOLDER command
+            download_cmd = f'DOWNLOAD_FOLDER {folder_name}'
+            success, error = self._send_command(download_cmd)
+            if not success:
+                return False, error
+            
+            # Receive response
+            response = self.sock.recv(1024).decode().strip()
+            
+            if response == 'FOLDER_NOT_FOUND':
+                return False, f"Folder not found on server: {folder_name}"
+            
+            if response == 'NOT_A_FOLDER':
+                return False, f"Not a folder: {folder_name}"
+            
+            if response == 'FOLDER_EMPTY':
+                return False, "Folder is empty"
+            
+            if not response.startswith('FOLDER_INFO'):
+                return False, f"Invalid response: {response}"
+            
+            # Parse folder info: FOLDER_INFO <folder_name> <file_count>
+            parts = response.split()
+            if len(parts) != 3:
+                return False, "Invalid FOLDER_INFO format"
+            
+            _, server_folder_name, file_count_str = parts
+            file_count = int(file_count_str)
+            
+            # Determine save path
+            if save_path is None:
+                save_path = server_folder_name
+            
+            # Handle duplicate folder names
+            counter = 1
+            original_path = save_path
+            while os.path.exists(save_path):
+                save_path = f"{original_path}_{counter}"
+                counter += 1
+            
+            # Create folder
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Send READY
+            self.sock.send(b'FOLDER_READY')
+            
+            # Receive each file
+            files_received = 0
+            total_size = 0
+            start_time = time.time()
+            
+            for i in range(file_count):
+                # Receive file info
+                file_info = self.sock.recv(1024).decode().strip()
+                
+                if not file_info.startswith('REL_FILE_INFO'):
+                    return False, f"Invalid file info: {file_info}"
+                
+                # Parse: REL_FILE_INFO <relative_path> <size> <checksum>
+                info_parts = file_info.split()
+                if len(info_parts) != 4:
+                    return False, "Invalid REL_FILE_INFO format"
+                
+                _, rel_path, file_size_str, expected_checksum = info_parts
+                file_size = int(file_size_str)
+                
+                # Create full path
+                full_path = os.path.join(save_path, rel_path)
+                file_dir = os.path.dirname(full_path)
+                if file_dir:
+                    os.makedirs(file_dir, exist_ok=True)
+                
+                # Send READY
+                self.sock.send(b'READY')
+                
+                # Receive file data
+                bytes_received = 0
+                file_hash = hashlib.sha256()
+                
+                with open(full_path, 'wb') as f:
+                    while bytes_received < file_size:
+                        remaining = file_size - bytes_received
+                        chunk = self.sock.recv(min(65536, remaining))
+                        if not chunk:
+                            break
+                        
+                        f.write(chunk)
+                        file_hash.update(chunk)
+                        bytes_received += len(chunk)
+                        
+                        # Update progress
+                        if progress_callback:
+                            # For folder, show file progress
+                            file_progress = (bytes_received / file_size) * 100
+                            overall_progress = ((i + bytes_received / file_size) / file_count) * 100
+                            progress_callback(overall_progress, bytes_received, file_size)
+                
+                # Verify checksum
+                actual_checksum = file_hash.hexdigest()
+                
+                if actual_checksum == expected_checksum:
+                    self.sock.send(b'FILE_RECEIVED')
+                    files_received += 1
+                    total_size += file_size
+                    logging.info(f"Received file {files_received}/{file_count}: {rel_path}")
+                else:
+                    os.remove(full_path)
+                    return False, f"Checksum mismatch for {rel_path}"
+            
+            # Receive folder completion
+            folder_complete = self.sock.recv(1024).decode().strip()
+            
+            # Send final confirmation
+            self.sock.send(b'FOLDER_RECEIVED')
+            
+            transfer_time = time.time() - start_time
+            speed = total_size / transfer_time / (1024 * 1024) if transfer_time > 0 else 0
+            
+            return True, f"Folder downloaded: {save_path} ({files_received} files, {speed:.2f} MB/s)"
+            
+        except Exception as e:
+            logging.error(f"Download folder error: {e}")
+            if 'save_path' in locals() and os.path.exists(save_path):
+                import shutil
+                shutil.rmtree(save_path)
+            return False, str(e)
+    
+    def delete_file(self, filename):
+        """Deletes a file from the server"""
+        if not self.authenticated:
+            return False, "Authentication required"
+        
+        try:
+            # Send DELETE_FILE command
+            delete_cmd = f'DELETE_FILE {filename}'
+            success, error = self._send_command(delete_cmd)
+            if not success:
+                return False, error
+            
+            # Receive response
+            response = self.sock.recv(1024).decode().strip()
+            
+            if response.startswith('DELETE_OK'):
+                return True, response.replace('DELETE_OK ', '')
+            elif response.startswith('DELETE_FAIL'):
+                return False, response.replace('DELETE_FAIL ', '')
+            elif 'Permission denied' in response:
+                return False, "Permission denied: Admin only"
+            else:
+                return False, f"Unexpected response: {response}"
+                
+        except Exception as e:
+            logging.error(f"Delete file error: {e}")
+            return False, str(e)
+    
+    def delete_folder(self, folder_name):
+        """Deletes a folder from the server"""
+        if not self.authenticated:
+            return False, "Authentication required"
+        
+        try:
+            # Send DELETE_FOLDER command
+            delete_cmd = f'DELETE_FOLDER {folder_name}'
+            success, error = self._send_command(delete_cmd)
+            if not success:
+                return False, error
+            
+            # Receive response
+            response = self.sock.recv(1024).decode().strip()
+            
+            if response.startswith('DELETE_OK'):
+                return True, response.replace('DELETE_OK ', '')
+            elif response.startswith('DELETE_FAIL'):
+                return False, response.replace('DELETE_FAIL ', '')
+            elif 'Permission denied' in response:
+                return False, "Permission denied: Admin only"
+            else:
+                return False, f"Unexpected response: {response}"
+                
+        except Exception as e:
+            logging.error(f"Delete folder error: {e}")
+            return False, str(e)
+    
+    def rename_file(self, old_name, new_name):
+        """Renames a file on the server"""
+        if not self.authenticated:
+            return False, "Authentication required"
+        
+        try:
+            # Send RENAME_FILE command
+            rename_cmd = f'RENAME_FILE {old_name} {new_name}'
+            success, error = self._send_command(rename_cmd)
+            if not success:
+                return False, error
+            
+            # Receive response
+            response = self.sock.recv(1024).decode().strip()
+            
+            if response.startswith('RENAME_OK'):
+                return True, response.replace('RENAME_OK ', '')
+            elif response.startswith('RENAME_FAIL'):
+                return False, response.replace('RENAME_FAIL ', '')
+            elif 'Permission denied' in response:
+                return False, "Permission denied: Admin only"
+            else:
+                return False, f"Unexpected response: {response}"
+                
+        except Exception as e:
+            logging.error(f"Rename file error: {e}")
+            return False, str(e)
+    
+    def rename_folder(self, old_name, new_name):
+        """Renames a folder on the server"""
+        if not self.authenticated:
+            return False, "Authentication required"
+        
+        try:
+            # Send RENAME_FOLDER command
+            rename_cmd = f'RENAME_FOLDER {old_name} {new_name}'
+            success, error = self._send_command(rename_cmd)
+            if not success:
+                return False, error
+            
+            # Receive response
+            response = self.sock.recv(1024).decode().strip()
+            
+            if response.startswith('RENAME_OK'):
+                return True, response.replace('RENAME_OK ', '')
+            elif response.startswith('RENAME_FAIL'):
+                return False, response.replace('RENAME_FAIL ', '')
+            elif 'Permission denied' in response:
+                return False, "Permission denied: Admin only"
+            else:
+                return False, f"Unexpected response: {response}"
+                
+        except Exception as e:
+            logging.error(f"Rename folder error: {e}")
+            return False, str(e)
+    
     def disconnect(self):
         """Закрывает соединение"""
         if self.sock:
@@ -402,6 +840,7 @@ class TCPClient:
                 self.sock = None
                 self.authenticated = False
                 self.username = None
+                self.jwt_token = None
         logging.info("Connection closed")
     
     def connect(self):
