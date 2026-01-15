@@ -227,86 +227,7 @@ class TCPServer:
         finally:
             # Восстанавливаем стандартный таймаут
             conn.settimeout(None)
-
-    def receive_large_file(self, conn, filename, expected_size):
-        """
-        Прием больших файлов потоковым способом
-        """
-        try:
-            file_path = os.path.join(UPLOAD_DIR, filename)
-            
-            # Уникальное имя файла
-            counter = 1
-            name, ext = os.path.splitext(filename)
-            while os.path.exists(file_path):
-                filename = f"{name}_{counter}{ext}"
-                file_path = os.path.join(UPLOAD_DIR, filename)
-                counter += 1
-            
-            conn.send(b'READY_STREAM')
-            logging.info(f"Receiving large file: {filename} ({expected_size:,} bytes)")
-            
-            # Начинаем прием потоковым способом
-            bytes_received = 0
-            file_hash = hashlib.sha256()
-            
-            with open(file_path, 'wb') as f:
-                while bytes_received < int(expected_size):
-                    try:
-                        # Получаем размер чанка (4 байта)
-                        header = conn.recv(4)
-                        if not header:
-                            break
-                        
-                        chunk_size = int.from_bytes(header, 'big')
-                        
-                        # Получаем сам чанк
-                        chunk = b''
-                        while len(chunk) < chunk_size:
-                            remaining = chunk_size - len(chunk)
-                            part = conn.recv(min(65536, remaining))
-                            if not part:
-                                break
-                            chunk += part
-                        
-                        if not chunk:
-                            break
-                        
-                        # Записываем и обновляем хеш
-                        f.write(chunk)
-                        file_hash.update(chunk)
-                        bytes_received += len(chunk)
-                        
-                        # Логируем прогресс каждые 100MB
-                        if bytes_received % (100 * 1024 * 1024) < len(chunk):
-                            progress = (bytes_received / int(expected_size)) * 100
-                            logging.info(f"Received: {bytes_received:,}/{expected_size:,} bytes ({progress:.1f}%)")
-                            
-                    except socket.timeout:
-                        logging.warning("Socket timeout during transfer, continuing...")
-                        continue
-            
-            # Ждем финальный хеш от клиента
-            hash_data = conn.recv(1024).decode()
-            if hash_data.startswith('FILE_HASH'):
-                client_hash = hash_data.split()[1]
-                server_hash = file_hash.hexdigest()
-                
-                if client_hash == server_hash:
-                    logging.info(f"Large file received successfully: {filename}")
-                    conn.send(f'FILE_OK Hash: {server_hash[:16]}...'.encode())
-                    return True, f"File received: {bytes_received:,} bytes"
-                else:
-                    logging.error(f"Hash mismatch for large file {filename}")
-                    os.remove(file_path)  # Удаляем поврежденный файл
-                    conn.send(f'FILE_CORRUPTED Server hash: {server_hash}'.encode())
-                    return False, "Hash mismatch"
-            else:
-                return False, "No hash received"
-                
-        except Exception as e:
-            logging.error(f"Large file receive error: {e}")
-            return False, str(e)    
+    
     def receive_file(self, conn, client_ip, filename, expected_size, expected_checksum):
         """Принимает файл и проверяет целостность"""
         try:
@@ -327,7 +248,7 @@ class TCPServer:
             received_data = b''
             bytes_received = 0
             chunk_size = 4096
-            self.udp_socket.settimeout(10)  # Timeout for UDP receive
+            self.udp_socket.settimeout(30)  # Timeout for UDP receive
             
             while bytes_received < int(expected_size):
                 try:

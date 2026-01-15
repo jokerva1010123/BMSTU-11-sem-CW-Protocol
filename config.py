@@ -29,7 +29,7 @@ ALLOW_ANONYMOUS = False
 SESSION_TIMEOUT = 300     # Session timeout in seconds
 
 # JWT settings
-JWT_SECRET_KEY = "your-secret-key-change-this-in-production"  # Change this to a secure key
+JWT_SECRET_KEY = "key"  # Change this to a secure key
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24  # Token expires in 24 hours
 

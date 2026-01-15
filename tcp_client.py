@@ -27,10 +27,18 @@ class TCPClient:
         self.jwt_token = None
     
     def connect(self):
-        """Устанавливает соединение с сервером"""
+        """Устанавливает соединение с сервером с настройками для больших файлов"""
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(10)
+            
+            # Настройки для больших файлов
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)  # 1MB буфер отправки
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)  # 1MB буфер приема
+            
+            # Большие таймауты для больших файлов
+            self.sock.settimeout(30.0)  # 30 секунд на операцию
+            
             self.sock.connect((self.server_ip, self.server_port))
             logging.info(f"Connected to {self.server_ip}:{self.server_port}")
             return True
@@ -137,8 +145,21 @@ class TCPClient:
             # Инициализируем хеш
             file_hash = hashlib.sha256()
             
-            # Устанавливаем таймаут для операций записи
-            self.sock.settimeout(30.0)
+            # Вычисляем динамический таймаут на основе размера файла
+            # Минимальная скорость: 100 KB/s (очень медленное соединение)
+            # Добавляем 50% запас + минимум 60 секунд
+            min_speed_kbps = 100  # 100 KB/s минимум
+            estimated_time = (file_size / 1024) / min_speed_kbps  # секунды
+            dynamic_timeout = max(estimated_time * 1.5, 60)  # минимум 60 секунд, +50% запас
+            
+            # Для очень больших файлов ограничиваем таймаут максимум 2 часа
+            dynamic_timeout = min(dynamic_timeout, 7200)  # 2 часа максимум
+            
+            logging.info(f"Using dynamic timeout: {dynamic_timeout:.0f} seconds for {file_size / (1024*1024*1024):.2f} GB file")
+            
+            # Для sendall операций отключаем таймаут - они должны блокироваться до завершения
+            # Таймаут нужен только для recv операций
+            self.sock.settimeout(None)  # No timeout for sendall - let it block until sent
             
             try:
                 with open(file_path, 'rb') as f:
@@ -156,8 +177,12 @@ class TCPClient:
                         # Отправляем размер чанка (4 байта) + данные
                         header = chunk_size.to_bytes(4, 'big')
                         
-                        # Отправляем все сразу
-                        self.sock.sendall(header + chunk)
+                        # Отправляем все сразу (sendall блокируется до полной отправки)
+                        try:
+                            self.sock.sendall(header + chunk)
+                        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                            logging.error(f"Connection error during send: {e}")
+                            raise
                         
                         bytes_sent += chunk_size
                         
@@ -170,35 +195,49 @@ class TCPClient:
                             
                             # Логируем прогресс
                             elapsed = current_time - start_time
-                            speed = bytes_sent / elapsed / (1024 * 1024)  # MB/s
-                            mb_sent = bytes_sent / (1024 * 1024)
-                            mb_total = file_size / (1024 * 1024)
-                            
-                            logging.info(f"Progress: {mb_sent:.1f}/{mb_total:.1f} MB ({progress:.1f}%) - {speed:.2f} MB/s")
+                            if elapsed > 0:
+                                speed = bytes_sent / elapsed / (1024 * 1024)  # MB/s
+                                mb_sent = bytes_sent / (1024 * 1024)
+                                mb_total = file_size / (1024 * 1024)
+                                progress = (bytes_sent / file_size) * 100
+                                
+                                logging.info(f"Progress: {mb_sent:.1f}/{mb_total:.1f} MB ({progress:.1f}%) - {speed:.2f} MB/s")
                             last_update = current_time
                             
-            except socket.timeout:
-                logging.warning("Socket timeout during send, but may continue...")
-                # Проверяем, может файл уже отправлен?
-                if bytes_sent >= file_size:
-                    logging.info("File appears to be fully sent despite timeout")
-                else:
-                    raise
-            
             finally:
-                # Восстанавливаем стандартный таймаут
-                self.sock.settimeout(None)
+                # Восстанавливаем таймаут для recv операций
+                self.sock.settimeout(dynamic_timeout)
             
             # Шаг 3: Отправляем финальный хеш
             final_hash = file_hash.hexdigest()
             hash_cmd = f"FILE_HASH {final_hash}"
-            self.sock.send(hash_cmd.encode())
             
-            # Шаг 4: Получаем результат
+            # Устанавливаем таймаут для отправки хеша (небольшая операция)
+            self.sock.settimeout(10.0)
+            try:
+                self.sock.send(hash_cmd.encode())
+            except socket.timeout:
+                logging.error("Timeout sending hash - connection may be broken")
+                raise
+            
+            # Шаг 4: Получаем результат с динамическим таймаутом
+            self.sock.settimeout(dynamic_timeout)
             transfer_time = time.time() - start_time
-            speed = file_size / transfer_time / (1024 * 1024)  # MB/s
             
-            result = self.sock.recv(1024).decode()
+            try:
+                result = self.sock.recv(1024).decode()
+            except socket.timeout:
+                # Если таймаут произошел при получении ответа, но файл отправлен
+                if bytes_sent >= file_size:
+                    logging.warning("Timeout waiting for server response, but file was fully sent")
+                    return False, "File sent but timeout waiting for server confirmation"
+                else:
+                    return False, f"Transfer timeout after {transfer_time:.1f}s - {bytes_sent}/{file_size} bytes sent"
+            
+            if transfer_time > 0:
+                speed = file_size / transfer_time / (1024 * 1024)  # MB/s
+            else:
+                speed = 0
             
             if result.startswith('FILE_OK'):
                 return True, f"Large file transferred: {speed:.2f} MB/s, time: {transfer_time:.1f}s"
@@ -207,8 +246,15 @@ class TCPClient:
             else:
                 return False, f"Transfer failed: {result}"
             
-        except socket.timeout:
-            return False, "Transfer timeout - connection too slow or interrupted"
+        except socket.timeout as e:
+            transfer_time = time.time() - start_time if 'start_time' in locals() else 0
+            bytes_transferred = bytes_sent if 'bytes_sent' in locals() else 0
+            return False, f"Transfer timeout after {transfer_time:.1f}s - {bytes_transferred}/{file_size} bytes sent"
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            transfer_time = time.time() - start_time if 'start_time' in locals() else 0
+            bytes_transferred = bytes_sent if 'bytes_sent' in locals() else 0
+            logging.error(f"Connection error: {e}")
+            return False, f"Connection broken after {transfer_time:.1f}s - {bytes_transferred}/{file_size} bytes sent"
         except Exception as e:
             logging.error(f"Large file transfer error: {e}")
             return False, str(e)
@@ -222,12 +268,11 @@ class TCPClient:
         except:
             return False, "Cannot get file size"
         
-        # Для файлов больше 100MB используем потоковый метод
-        if file_size > 100 * 1024 * 1024:  # 100 MB
-            print(1)
+        # Для файлов больше 10MB используем потоковый метод (TCP streaming)
+        # send_small_file использует UDP+ACK который медленный для больших файлов
+        if file_size > 10 * 1024 * 1024:  # 10 MB
             return self.send_large_file(file_path, progress_callback)
         else:
-            print(2)
             return self.send_small_file(file_path, progress_callback)
 
     def send_small_file(self, file_path, progress_callback=None):
@@ -247,13 +292,14 @@ class TCPClient:
             
             # Вычисляем контрольную сумму
             logging.info("Calculating file checksum...")
+            checksum_start = time.time()
             file_checksum = hashlib.sha256()
             with open(file_path, 'rb') as f:
                 while chunk := f.read(8192):
                     file_checksum.update(chunk)
+            checksum_time = time.time() - checksum_start
             checksum_hex = file_checksum.hexdigest()
-            
-            logging.info(f"Checksum: {checksum_hex[:16]}...")
+            logging.info(f"Checksum calculated in {checksum_time:.2f}s: {checksum_hex[:16]}...")
             
             # Отправляем метаданные
             file_cmd = f"FILE {filename} {file_size} {checksum_hex}"
@@ -270,7 +316,7 @@ class TCPClient:
             logging.info(f"Starting file transfer {filename} ({file_size} bytes)")
             
             bytes_sent = 0
-            start_time = time.time()
+            transfer_start = time.time()
             
             with open(file_path, 'rb') as f:
                 while bytes_sent < file_size:
@@ -296,14 +342,14 @@ class TCPClient:
                         progress_callback(progress, bytes_sent, file_size)
             
             # Безопасное деление
-            transfer_time = time.time() - start_time
+            transfer_time = time.time() - transfer_start
             if transfer_time > 0.001:
                 speed = file_size / transfer_time / 1024  # KB/s
                 speed_text = f"{speed:.2f} KB/s"
             else:
                 speed_text = "very fast"
             
-            logging.info(f"Transfer completed in {transfer_time:.3f} sec")
+            logging.info(f"Transfer completed in {transfer_time:.3f} sec ({speed_text}) - Checksum: {checksum_time:.2f}s")
             
             # Получаем результат проверки от сервера
             result = self.sock.recv(1024).decode()
@@ -843,26 +889,6 @@ class TCPClient:
                 self.jwt_token = None
         logging.info("Connection closed")
     
-    def connect(self):
-        """Устанавливает соединение с сервером с настройками для больших файлов"""
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            
-            # Настройки для больших файлов
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)  # 1MB буфер отправки
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)  # 1MB буфер приема
-            
-            # Большие таймауты для больших файлов
-            self.sock.settimeout(30.0)  # 30 секунд на операцию
-            
-            self.sock.connect((self.server_ip, self.server_port))
-            logging.info(f"Connected to {self.server_ip}:{self.server_port}")
-            return True
-        except Exception as e:
-            logging.error(f"Connection error: {e}")
-            return False
-
 if __name__ == "__main__":
     # Тестирование клиента
     import sys
