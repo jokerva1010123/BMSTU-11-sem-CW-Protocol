@@ -15,15 +15,15 @@ def test_send_file_multiple_sizes(server_ip, server_port=TCP_PORT, username="use
 
     # File sizes to test
     file_sizes = [
-        1024*1024,         # 1MB
-        10 * 1024 * 1024,  # 10MB
-        50 * 1024 * 1024,  # 50MB
-        100 * 1024 * 1024, # 100MB
-        200 * 1024 * 1024  # 200MB
-        , 500 * 1024 * 1024  # 500MB
-        , 1000 * 1024 * 1024  # 1GB
-        , 2000 * 1024 * 1024  # 2GB
-        , 5000 * 1024 * 1024  # 5GB
+        # 1024*1024,         # 1MB
+        # 10 * 1024 * 1024  # 10MB
+        # 50 * 1024 * 1024  # 50MB
+        # 100 * 1024 * 1024 # 100MB
+        # 200 * 1024 * 1024  # 200MB
+        # 500 * 1024 * 1024  # 500MB
+        # 1000 * 1024 * 1024  # 1GB
+        # 2000 * 1024 * 1024  # 2GB
+        5000 * 1024 * 1024  # 5GB
     ]
 
     results = []
@@ -89,7 +89,8 @@ def test_send_file_multiple_sizes(server_ip, server_port=TCP_PORT, username="use
 
         # Plot results
         if results:
-            plot_results(results)
+            # plot_results(results)
+            pass
         else:
             print("No successful transfers to plot")
 

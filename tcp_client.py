@@ -8,7 +8,15 @@ import hashlib
 import time
 import logging
 import json
-from config import TCP_PORT, UDP_DATA_PORT, CHUNK_SIZE
+import base64
+import datetime
+import sys
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from config import TCP_PORT, UDP_DATA_PORT, CHUNK_SIZE, UDP_PLAINTEXT_CHUNK_SIZE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,9 +30,17 @@ class TCPClient:
         self.sock = None
         self.udp_sock = None
         self.udp_data_port = None
+        self.client_udp_port = None
         self.authenticated = False
         self.username = None
         self.jwt_token = None
+        self.session_key = None
+        self.session_id = None
+        self.aesgcm = None
+        self.nonce_prefix = os.urandom(4)
+        self.nonce_counter = 0
+        self.commands_log = []  # Lưu trữ các lệnh
+        self.commands_log_file = 'commands_log.json'  # File log lệnh
     
     def connect(self):
         """Устанавливает соединение с сервером с настройками для больших файлов"""
@@ -41,6 +57,11 @@ class TCPClient:
             
             self.sock.connect((self.server_ip, self.server_port))
             logging.info(f"Connected to {self.server_ip}:{self.server_port}")
+
+            # Выполняем X25519 рукопожатие для получения AES ключа
+            if not self.perform_handshake():
+                logging.error("Handshake failed")
+                return False
             return True
         except Exception as e:
             logging.error(f"Connection error: {e}")
@@ -73,12 +94,14 @@ class TCPClient:
                 self.authenticated = True
                 self.username = username
                 
-                # Receive UDP data port
+                # Receive UDP data port (plain text - before JSON encryption)
                 udp_port_msg = self.sock.recv(1024).decode().strip()
                 if udp_port_msg.startswith('UDP_PORT'):
                     self.udp_data_port = int(udp_port_msg.split()[1])
                     # Initialize UDP socket
                     self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    self.udp_sock.bind(('0.0.0.0', 0))
+                    self.client_udp_port = self.udp_sock.getsockname()[1]
                     logging.info(f"UDP data port: {self.udp_data_port}")
                 else:
                     logging.error("Did not receive UDP port")
@@ -93,191 +116,362 @@ class TCPClient:
         except Exception as e:
             logging.error(f"Authentication error: {e}")
             return False
+
+    def perform_handshake(self):
+        """3-step X25519 Diffie-Hellman handshake to derive AES key"""
+        try:
+            client_private = X25519PrivateKey.generate()
+            client_public_bytes = client_private.public_key().public_bytes(
+                encoding=Encoding.Raw,
+                format=PublicFormat.Raw
+            )
+            client_pub_b64 = base64.b64encode(client_public_bytes).decode()
+            self.sock.send(f"KEYEX {client_pub_b64}".encode())
+
+            server_response = self.sock.recv(2048).decode().strip()
+            if not server_response.startswith("KEYRESP"):
+                logging.error(f"Unexpected handshake response: {server_response}")
+                return False
+
+            parts = server_response.split()
+            if len(parts) != 3:
+                logging.error("Malformed KEYRESP")
+                return False
+
+            _, server_pub_b64, session_id_hex = parts
+            server_pub_bytes = base64.b64decode(server_pub_b64)
+            server_public = X25519PublicKey.from_public_bytes(server_pub_bytes)
+            shared_secret = client_private.exchange(server_public)
+
+            hkdf = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b"lftp-x25519-handshake",
+            )
+            self.session_key = hkdf.derive(shared_secret)
+            self.aesgcm = AESGCM(self.session_key)
+            self.session_id = bytes.fromhex(session_id_hex)
+            self.nonce_counter = 0
+            self.sock.send(b"KEY_OK")
+            logging.info("Handshake complete, AES key derived")
+            return True
+        except Exception as e:
+            logging.error(f"Handshake error: {e}")
+            return False
+
+    def _next_nonce(self):
+        """Returns unique 12-byte nonce for AES-GCM"""
+        nonce = self.nonce_prefix + self.nonce_counter.to_bytes(8, 'big')
+        self.nonce_counter += 1
+        return nonce
+
+    def _encrypt_chunk(self, chunk: bytes) -> bytes:
+        """Encrypts chunk with session AES key, prepending session id and nonce"""
+        if not self.aesgcm or not self.session_id:
+            raise RuntimeError("Handshake not completed")
+        nonce = self._next_nonce()
+        ciphertext = self.aesgcm.encrypt(nonce, chunk, None)
+        return self.session_id + nonce + ciphertext
+
+    def _decrypt_packet(self, packet: bytes) -> bytes:
+        """Decrypts UDP packet that has session id + nonce + ciphertext"""
+        if not self.aesgcm or not self.session_id:
+            raise RuntimeError("Handshake not completed")
+        if len(packet) < 4 + 12:
+            raise ValueError("Packet too short for nonce")
+        pkt_session = packet[:4]
+        if pkt_session != self.session_id:
+            raise ValueError("Session mismatch")
+        nonce = packet[4:16]
+        ciphertext = packet[16:]
+        return self.aesgcm.decrypt(nonce, ciphertext, None)
     
-    def _send_command(self, command):
-        """Отправляет команду с JWT токеном"""
+    def _encrypt_command(self, command: str) -> str:
+        """Deprecated - tất cả lệnh giờ được gửi dưới dạng JSON mã hóa"""
+        return None
+    
+    def _recv_json_response(self):
+        """Nhận và giải mã response JSON từ server"""
+        try:
+            # Nhận dữ liệu base64
+            encrypted_data_b64 = self.sock.recv(4096).decode().strip()
+            if not encrypted_data_b64:
+                return None
+            
+            # Decode từ base64
+            encrypted_data = base64.b64decode(encrypted_data_b64)
+            
+            # Kiểm tra có dùng AES-GCM hay base64 thôi
+            if self.aesgcm and self.session_id:
+                # Giải mã AES-GCM
+                if len(encrypted_data) < 4 + 12:
+                    logging.error("Encrypted data too short")
+                    return None
+                
+                pkt_session = encrypted_data[:4]
+                if pkt_session != self.session_id:
+                    logging.error("Session mismatch in decryption")
+                    return None
+                
+                # Lấy nonce và ciphertext
+                nonce = encrypted_data[4:16]
+                ciphertext = encrypted_data[16:]
+                
+                try:
+                    json_str = self.aesgcm.decrypt(nonce, ciphertext, None).decode('utf-8')
+                except Exception as e:
+                    logging.error(f"Decryption error: {e}")
+                    return None
+            else:
+                # Base64 thôi (chưa có session key)
+                json_str = encrypted_data.decode('utf-8')
+            
+            # Parse JSON
+            response_data = json.loads(json_str)
+            return response_data
+        except Exception as e:
+            logging.error(f"Error receiving JSON response: {e}")
+            return None
+    
+    def _log_command_to_json(self, command: str, encrypted_command: str, status: str = 'sent'):
+        """Ghi lệnh vào file JSON"""
+        try:
+            # Tải log hiện tại
+            if os.path.exists(self.commands_log_file):
+                with open(self.commands_log_file, 'r', encoding='utf-8') as f:
+                    try:
+                        self.commands_log = json.load(f)
+                    except:
+                        self.commands_log = []
+            
+            # Thêm entry mới
+            log_entry = {
+                'timestamp': datetime.datetime.now().isoformat(),
+                'username': self.username,
+                'original_command': command,
+                'encrypted_command': encrypted_command,
+                'status': status,
+                'server': f"{self.server_ip}:{self.server_port}"
+            }
+            self.commands_log.append(log_entry)
+            
+            # Lưu vào file
+            with open(self.commands_log_file, 'w', encoding='utf-8') as f:
+                json.dump(self.commands_log, f, indent=2, ensure_ascii=False)
+            
+            logging.info(f"Command logged to {self.commands_log_file}")
+        except Exception as e:
+            logging.error(f"Error logging command: {e}")
+    
+    def _send_json_command(self, command: str, **kwargs):
+        """Gửi lệnh dưới dạng JSON mã hóa với AES-GCM"""
         if not self.authenticated or not self.jwt_token:
             return False, "Not authenticated"
         
         try:
-            full_command = f"TOKEN {self.jwt_token} {command}"
-            self.sock.send(full_command.encode())
+            # Tạo JSON packet
+            json_packet = {
+                'token': self.jwt_token,
+                'command': command,
+                'timestamp': datetime.datetime.now().isoformat(),
+                'username': self.username
+            }
+            # Thêm các tham số phụ (nếu có)
+            json_packet.update(kwargs)
+            
+            # Chuyển sang JSON string
+            json_str = json.dumps(json_packet)
+            
+            # Mã hóa JSON với AES-GCM
+            if self.aesgcm and self.session_id:
+                nonce = self._next_nonce()
+                ciphertext = self.aesgcm.encrypt(nonce, json_str.encode(), None)
+                encrypted_data = self.session_id + nonce + ciphertext
+                encrypted_b64 = base64.b64encode(encrypted_data).decode()
+            else:
+                # Nếu chưa có session key, dùng base64
+                encrypted_b64 = base64.b64encode(json_str.encode()).decode()
+            
+            # Gửi dữ liệu mã hóa
+            self.sock.send(encrypted_b64.encode())
+            
+            # Ghi vào log
+            self._log_command_to_json(command, encrypted_b64, 'sent')
+            
+            logging.info(f"Encrypted JSON command sent: {command}")
             return True, None
         except Exception as e:
-            logging.error(f"Error sending command: {e}")
+            logging.error(f"Error sending JSON command: {e}")
+            self._log_command_to_json(command, "", 'failed')
             return False, str(e)
         
-    def send_large_file(self, file_path, progress_callback=None):
-        """
-        Оптимизированная передача больших файлов с потоковым хешированием
-        """
-        if not self.authenticated:
-            return False, "Authentication required"
+    # def send_large_file(self, file_path, progress_callback=None):
+    #     """
+    #     Оптимизированная передача больших файлов с потоковым хешированием
+    #     """
+    #     if not self.authenticated:
+    #         return False, "Authentication required"
         
-        if not os.path.exists(file_path):
-            return False, "File does not exist"
+    #     if not os.path.exists(file_path):
+    #         return False, "File does not exist"
         
-        try:
-            file_size = os.path.getsize(file_path)
-            filename = os.path.basename(file_path)
+    #     try:
+    #         file_size = os.path.getsize(file_path)
+    #         filename = os.path.basename(file_path)
             
-            logging.info(f"Preparing to send large file: {filename} ({file_size:,} bytes)")
+    #         logging.info(f"Preparing to send large file: {filename} ({file_size:,} bytes)")
             
-            # Шаг 1: Отправляем команду начала потоковой передачи
-            file_cmd = f"STREAM_FILE {filename} {file_size}"
-            success, error = self._send_command(file_cmd)
-            if not success:
-                return False, error
+    #         # Шаг 1: Отправляем команду начала потоковой передачи
+    #         file_cmd = f"STREAM_FILE {filename} {file_size}"
+    #         success, error = self._send_json_command(file_cmd)
+    #         if not success:
+    #             return False, error
             
-            # Ждем подтверждения (с таймаутом)
-            self.sock.settimeout(10.0)
-            response = self.sock.recv(1024).decode()
-            self.sock.settimeout(None)
+    #         # Ждем подтверждения (с таймаутом)
+    #         self.sock.settimeout(10.0)
+    #         ready_response = self._recv_json_response()
+    #         self.sock.settimeout(None)
             
-            if response != 'READY_STREAM':
-                return False, f"Server not ready for streaming: {response}"
+    #         if not ready_response or ready_response.get('command') != 'READY_STREAM':
+    #             return False, f"Server not ready for streaming: {ready_response}"
             
-            # Шаг 2: Потоковая передача с прогрессивным хешированием
-            bytes_sent = 0
-            start_time = time.time()
-            last_update = start_time
+    #         # Шаг 2: Потоковая передача с прогрессивным хешированием
+    #         bytes_sent = 0
+    #         start_time = time.time()
+    #         last_update = start_time
             
-            # Инициализируем хеш
-            file_hash = hashlib.sha256()
+    #         # Инициализируем хеш
+    #         file_hash = hashlib.sha256()
             
-            # Вычисляем динамический таймаут на основе размера файла
-            # Минимальная скорость: 100 KB/s (очень медленное соединение)
-            # Добавляем 50% запас + минимум 60 секунд
-            min_speed_kbps = 100  # 100 KB/s минимум
-            estimated_time = (file_size / 1024) / min_speed_kbps  # секунды
-            dynamic_timeout = max(estimated_time * 1.5, 60)  # минимум 60 секунд, +50% запас
+    #         # Вычисляем динамический таймаут на основе размера файла
+    #         # Минимальная скорость: 100 KB/s (очень медленное соединение)
+    #         # Добавляем 50% запас + минимум 60 секунд
+    #         min_speed_kbps = 100  # 100 KB/s минимум
+    #         estimated_time = (file_size / 1024) / min_speed_kbps  # секунды
+    #         dynamic_timeout = max(estimated_time * 1.5, 60)  # минимум 60 секунд, +50% запас
             
-            # Для очень больших файлов ограничиваем таймаут максимум 2 часа
-            dynamic_timeout = min(dynamic_timeout, 7200)  # 2 часа максимум
+    #         # Для очень больших файлов ограничиваем таймаут максимум 2 часа
+    #         dynamic_timeout = min(dynamic_timeout, 7200)  # 2 часа максимум
             
-            logging.info(f"Using dynamic timeout: {dynamic_timeout:.0f} seconds for {file_size / (1024*1024*1024):.2f} GB file")
+    #         logging.info(f"Using dynamic timeout: {dynamic_timeout:.0f} seconds for {file_size / (1024*1024*1024):.2f} GB file")
             
-            # Для sendall операций отключаем таймаут - они должны блокироваться до завершения
-            # Таймаут нужен только для recv операций
-            self.sock.settimeout(None)  # No timeout for sendall - let it block until sent
+    #         # Для sendall операций отключаем таймаут - они должны блокироваться до завершения
+    #         # Таймаут нужен только для recv операций
+    #         self.sock.settimeout(None)  # No timeout for sendall - let it block until sent
             
-            try:
-                with open(file_path, 'rb') as f:
-                    while True:
-                        # Читаем большими чанками (1MB оптимально для больших файлов)
-                        chunk = f.read(1024 * 1024)  # 1MB
-                        if not chunk:
-                            break
+    #         try:
+    #             with open(file_path, 'rb') as f:
+    #                 while True:
+    #                     # Читаем большими чанками (1MB оптимально для больших файлов)
+    #                     chunk = f.read(1024 * 1024)  # 1MB
+    #                     if not chunk:
+    #                         break
                         
-                        chunk_size = len(chunk)
+    #                     chunk_size = len(chunk)
                         
-                        # Обновляем хеш
-                        file_hash.update(chunk)
+    #                     # Обновляем хеш
+    #                     file_hash.update(chunk)
                         
-                        # Отправляем размер чанка (4 байта) + данные
-                        header = chunk_size.to_bytes(4, 'big')
+    #                     # Отправляем размер чанка (4 байта) + данные
+    #                     header = chunk_size.to_bytes(4, 'big')
                         
-                        # Отправляем все сразу (sendall блокируется до полной отправки)
-                        try:
-                            self.sock.sendall(header + chunk)
-                        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                            logging.error(f"Connection error during send: {e}")
-                            raise
+    #                     # Отправляем все сразу (sendall блокируется до полной отправки)
+    #                     try:
+    #                         self.sock.sendall(header + chunk)
+    #                     except (BrokenPipeError, ConnectionResetError, OSError) as e:
+    #                         logging.error(f"Connection error during send: {e}")
+    #                         raise
                         
-                        bytes_sent += chunk_size
+    #                     bytes_sent += chunk_size
                         
-                        # Обновляем прогресс (не слишком часто, чтобы не замедлять)
-                        current_time = time.time()
-                        if current_time - last_update > 1.0:  # Каждую секунду
-                            if progress_callback:
-                                progress = (bytes_sent / file_size) * 100
-                                progress_callback(progress, bytes_sent, file_size)
+    #                     # Обновляем прогресс (не слишком часто, чтобы не замедлять)
+    #                     current_time = time.time()
+    #                     if current_time - last_update > 1.0:  # Каждую секунду
+    #                         if progress_callback:
+    #                             progress = (bytes_sent / file_size) * 100
+    #                             progress_callback(progress, bytes_sent, file_size)
                             
-                            # Логируем прогресс
-                            elapsed = current_time - start_time
-                            if elapsed > 0:
-                                speed = bytes_sent / elapsed / (1024 * 1024)  # MB/s
-                                mb_sent = bytes_sent / (1024 * 1024)
-                                mb_total = file_size / (1024 * 1024)
-                                progress = (bytes_sent / file_size) * 100
+    #                         # Логируем прогресс
+    #                         elapsed = current_time - start_time
+    #                         if elapsed > 0:
+    #                             speed = bytes_sent / elapsed / (1024 * 1024)  # MB/s
+    #                             mb_sent = bytes_sent / (1024 * 1024)
+    #                             mb_total = file_size / (1024 * 1024)
+    #                             progress = (bytes_sent / file_size) * 100
                                 
-                                logging.info(f"Progress: {mb_sent:.1f}/{mb_total:.1f} MB ({progress:.1f}%) - {speed:.2f} MB/s")
-                            last_update = current_time
+    #                             logging.info(f"Progress: {mb_sent:.1f}/{mb_total:.1f} MB ({progress:.1f}%) - {speed:.2f} MB/s")
+    #                         last_update = current_time
                             
-            finally:
-                # Восстанавливаем таймаут для recv операций
-                self.sock.settimeout(dynamic_timeout)
+    #         finally:
+    #             # Восстанавливаем таймаут для recv операций
+    #             self.sock.settimeout(dynamic_timeout)
             
-            # Шаг 3: Отправляем финальный хеш
-            final_hash = file_hash.hexdigest()
-            hash_cmd = f"FILE_HASH {final_hash}"
+    #         # Шаг 3: Отправляем финальный хеш
+    #         final_hash = file_hash.hexdigest()
+    #         hash_cmd = f"FILE_HASH {final_hash}"
             
-            # Устанавливаем таймаут для отправки хеша (небольшая операция)
-            self.sock.settimeout(10.0)
-            try:
-                self.sock.send(hash_cmd.encode())
-            except socket.timeout:
-                logging.error("Timeout sending hash - connection may be broken")
-                raise
+    #         # Устанавливаем таймаут для отправки хеша (небольшая операция)
+    #         self.sock.settimeout(10.0)
+    #         try:
+    #             self.sock.send(hash_cmd.encode())
+    #         except socket.timeout:
+    #             logging.error("Timeout sending hash - connection may be broken")
+    #             raise
             
-            # Шаг 4: Получаем результат с динамическим таймаутом
-            self.sock.settimeout(dynamic_timeout)
-            transfer_time = time.time() - start_time
+    #         # Шаг 4: Получаем результат с динамическим таймаутом
+    #         self.sock.settimeout(dynamic_timeout)
+    #         transfer_time = time.time() - start_time
             
-            try:
-                result = self.sock.recv(1024).decode()
-            except socket.timeout:
-                # Если таймаут произошел при получении ответа, но файл отправлен
-                if bytes_sent >= file_size:
-                    logging.warning("Timeout waiting for server response, but file was fully sent")
-                    return False, "File sent but timeout waiting for server confirmation"
-                else:
-                    return False, f"Transfer timeout after {transfer_time:.1f}s - {bytes_sent}/{file_size} bytes sent"
+    #         try:
+    #             result_response = self._recv_json_response()
+    #         except socket.timeout:
+    #             # Если таймаут произошел при получении ответа, но файл отправлен
+    #             if bytes_sent >= file_size:
+    #                 logging.warning("Timeout waiting for server response, but file was fully sent")
+    #                 return False, "File sent but timeout waiting for server confirmation"
+    #             else:
+    #                 return False, f"Transfer timeout after {transfer_time:.1f}s - {bytes_sent}/{file_size} bytes sent"
             
-            if transfer_time > 0:
-                speed = file_size / transfer_time / (1024 * 1024)  # MB/s
-            else:
-                speed = 0
+    #         if transfer_time > 0:
+    #             speed = file_size / transfer_time / (1024 * 1024)  # MB/s
+    #         else:
+    #             speed = 0
             
-            if result.startswith('FILE_OK'):
-                return True, f"Large file transferred: {speed:.2f} MB/s, time: {transfer_time:.1f}s"
-            elif result.startswith('FILE_CORRUPTED'):
-                return False, f"Hash mismatch detected: {result}"
-            else:
-                return False, f"Transfer failed: {result}"
+    #         if result_response and result_response.get('command') == 'FILE_OK':
+    #             return True, f"Large file transferred: {speed:.2f} MB/s, time: {transfer_time:.1f}s"
+    #         elif result_response and result_response.get('command') == 'FILE_CORRUPTED':
+    #             return False, f"Hash mismatch detected: {result_response}"
+    #         else:
+    #             return False, f"Transfer failed: {result_response}"
             
-        except socket.timeout as e:
-            transfer_time = time.time() - start_time if 'start_time' in locals() else 0
-            bytes_transferred = bytes_sent if 'bytes_sent' in locals() else 0
-            return False, f"Transfer timeout after {transfer_time:.1f}s - {bytes_transferred}/{file_size} bytes sent"
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            transfer_time = time.time() - start_time if 'start_time' in locals() else 0
-            bytes_transferred = bytes_sent if 'bytes_sent' in locals() else 0
-            logging.error(f"Connection error: {e}")
-            return False, f"Connection broken after {transfer_time:.1f}s - {bytes_transferred}/{file_size} bytes sent"
-        except Exception as e:
-            logging.error(f"Large file transfer error: {e}")
-            return False, str(e)
+    #     except socket.timeout as e:
+    #         transfer_time = time.time() - start_time if 'start_time' in locals() else 0
+    #         bytes_transferred = bytes_sent if 'bytes_sent' in locals() else 0
+    #         return False, f"Transfer timeout after {transfer_time:.1f}s - {bytes_transferred}/{file_size} bytes sent"
+    #     except (BrokenPipeError, ConnectionResetError, OSError) as e:
+    #         transfer_time = time.time() - start_time if 'start_time' in locals() else 0
+    #         bytes_transferred = bytes_sent if 'bytes_sent' in locals() else 0
+    #         logging.error(f"Connection error: {e}")
+    #         return False, f"Connection broken after {transfer_time:.1f}s - {bytes_transferred}/{file_size} bytes sent"
+    #     except Exception as e:
+    #         logging.error(f"Large file transfer error: {e}")
+    #         return False, str(e)
 
     def send_file(self, file_path, progress_callback=None):
         """
-        Умный выбор метода передачи в зависимости от размера файла
+        Передача файлов по UDP с шифрованием AES-GCM
         """
         try:
             file_size = os.path.getsize(file_path)
         except:
             return False, "Cannot get file size"
         
-        # Для файлов больше 10MB используем потоковый метод (TCP streaming)
-        # send_small_file использует UDP+ACK который медленный для больших файлов
-        if file_size > 10 * 1024 * 1024:  # 10 MB
-            return self.send_large_file(file_path, progress_callback)
-        else:
-            return self.send_small_file(file_path, progress_callback)
+        return self.send_small_file(file_path, progress_callback)
 
     def send_small_file(self, file_path, progress_callback=None):
         """
-        Оригинальный метод для небольших файлов
+        Зашифрованная передача файла через UDP
         """
         if not self.authenticated:
             return False, "Authentication required"
@@ -286,11 +480,9 @@ class TCPClient:
             return False, "File does not exist"
         
         try:
-            # Получаем информацию о файле
             file_size = os.path.getsize(file_path)
             filename = os.path.basename(file_path)
-            
-            # Вычисляем контрольную сумму
+
             logging.info("Calculating file checksum...")
             checksum_start = time.time()
             file_checksum = hashlib.sha256()
@@ -300,64 +492,61 @@ class TCPClient:
             checksum_time = time.time() - checksum_start
             checksum_hex = file_checksum.hexdigest()
             logging.info(f"Checksum calculated in {checksum_time:.2f}s: {checksum_hex[:16]}...")
-            
-            # Отправляем метаданные
+
             file_cmd = f"FILE {filename} {file_size} {checksum_hex}"
-            success, error = self._send_command(file_cmd)
+            success, error = self._send_json_command(file_cmd)
             if not success:
                 return False, error
-            
-            # Ждем подтверждения от сервера
-            response = self.sock.recv(1024).decode()
-            if response != 'READY':
-                return False, f"Server not ready: {response}"
-            
-            # Отправляем файл
-            logging.info(f"Starting file transfer {filename} ({file_size} bytes)")
-            
+
+            # Nhận READY_UDP response (JSON mã hóa)
+            response_data = self._recv_json_response()
+            if not response_data or response_data.get('command') != 'READY_UDP':
+                return False, f"Server not ready: {response_data}"
+
+            logging.info(f"Starting encrypted UDP transfer {filename} ({file_size} bytes)")
             bytes_sent = 0
             transfer_start = time.time()
-            
+            self.sock.settimeout(15.0)
+
             with open(file_path, 'rb') as f:
                 while bytes_sent < file_size:
-                    chunk = f.read(4096)
+                    # UDP must stay small to avoid fragmentation / WinError 10040
+                    chunk = f.read(UDP_PLAINTEXT_CHUNK_SIZE)
                     if not chunk:
                         break
-                    
-                    self.udp_sock.sendto(chunk, (self.server_ip, self.udp_data_port))
+
+                    packet = self._encrypt_chunk(chunk)
+                    self.udp_sock.sendto(packet, (self.server_ip, self.udp_data_port))
                     bytes_sent += len(chunk)
-                    
-                    # Receive ACK from TCP
+
                     try:
-                        ack = self.sock.recv(1024).decode().strip()
-                        if ack.startswith('ACK'):
-                            ack_bytes = int(ack.split()[1])
-                            # Optional: check if ack_bytes == bytes_sent
-                    except:
-                        pass  # For now, ignore
-                    
-                    # Вызываем callback для обновления прогресса
+                        # Nhận ACK response (JSON mã hóa)
+                        ack_response = self._recv_json_response()
+                        if ack_response and ack_response.get('command') == 'ACK':
+                            pass
+                    except socket.timeout:
+                        pass
+
                     if progress_callback:
                         progress = (bytes_sent / file_size) * 100
                         progress_callback(progress, bytes_sent, file_size)
-            
-            # Безопасное деление
+
             transfer_time = time.time() - transfer_start
             if transfer_time > 0.001:
-                speed = file_size / transfer_time / 1024  # KB/s
+                speed = file_size / transfer_time / 1024
                 speed_text = f"{speed:.2f} KB/s"
             else:
                 speed_text = "very fast"
-            
+
             logging.info(f"Transfer completed in {transfer_time:.3f} sec ({speed_text}) - Checksum: {checksum_time:.2f}s")
-            
-            # Получаем результат проверки от сервера
-            result = self.sock.recv(1024).decode()
-            
-            if result.startswith('FILE_OK'):
+
+            # Nhận FILE_OK response (JSON mã hóa)
+            result_response = self._recv_json_response()
+
+            if result_response and result_response.get('command') == 'FILE_OK':
                 return True, f"File transferred successfully ({speed_text})"
             else:
-                return False, f"Integrity error: {result}"
+                return False, f"Integrity error: {result_response}"
             
         except Exception as e:
             logging.error(f"File transfer error: {e}")
@@ -365,10 +554,13 @@ class TCPClient:
         
     def send_folder(self, folder_path, progress_callback=None):
         """
-        Sends entire folder with structure
+        Sends entire folder with structure using JSON commands
         """
         if not os.path.isdir(folder_path):
             return False, "Not a directory"
+        
+        if not self.authenticated:
+            return False, "Authentication required"
         
         try:
             folder_name = os.path.basename(folder_path.rstrip('/\\'))
@@ -387,16 +579,14 @@ class TCPClient:
             
             logging.info(f"Preparing to send folder '{folder_name}' with {len(all_files)} files")
             
-            # First, send FOLDER_START command
-            folder_start_cmd = f"FOLDER_START {folder_name} {len(all_files)}"
-            success, error = self._send_command(folder_start_cmd)
-            if not success:
-                return False, error
+            # First, send FOLDER_START command via JSON
+            folder_cmd = f"FOLDER_START {folder_name} {len(all_files)}"
+            self._send_json_command(folder_cmd)
             
-            # Wait for server acknowledgement
-            response = self.sock.recv(1024).decode()
-            if response != 'FOLDER_READY':
-                return False, f"Server not ready for folder: {response}"
+            # Wait for server acknowledgement (JSON response)
+            response_data = self._recv_json_response()
+            if not response_data or response_data.get('command') != 'FOLDER_READY':
+                return False, f"Server not ready for folder: {response_data}"
             
             # Send each file
             files_sent = 0
@@ -417,12 +607,13 @@ class TCPClient:
                 except Exception as e:
                     return False, f"Error sending {rel_path}: {e}"
             
-            # Send folder completion
-            self.sock.send(f"FOLDER_END {folder_name} {files_sent}".encode())
+            # Send folder completion via JSON
+            folder_end_cmd = f"FOLDER_END {folder_name} {files_sent}"
+            self._send_json_command(folder_end_cmd)
             
-            # Get final confirmation
-            final_response = self.sock.recv(1024).decode()
-            if final_response.startswith('FOLDER_COMPLETE'):
+            # Get final confirmation (JSON response)
+            final_response = self._recv_json_response()
+            if final_response and final_response.get('command') == 'FOLDER_COMPLETE':
                 return True, f"Folder '{folder_name}' sent: {files_sent} files, {total_size} bytes"
             else:
                 return False, f"Folder transfer incomplete: {final_response}"
@@ -432,7 +623,7 @@ class TCPClient:
             return False, str(e)
 
     def _send_single_file(self, file_path, rel_path, progress_callback=None):
-        """Helper to send a single file with custom filename"""
+        """Helper to send a single file with custom filename using JSON"""
         if not os.path.exists(file_path):
             return False, "File does not exist"
         
@@ -447,14 +638,33 @@ class TCPClient:
                     file_checksum.update(chunk)
             checksum_hex = file_checksum.hexdigest()
             
-            # Send file metadata with RELATIVE path
-            file_cmd = f"REL_FILE {rel_path} {file_size} {checksum_hex}"
-            self.sock.send(file_cmd.encode())
+            # Send file metadata with RELATIVE path (not JSON, plain text for server parsing)
+            rel_file_cmd = f"REL_FILE {rel_path} {file_size} {checksum_hex}"
             
-            # Wait for READY
-            response = self.sock.recv(1024).decode()
-            if response != 'READY':
-                return False, f"Server not ready: {response}"
+            # Create JSON packet for REL_FILE command
+            json_packet = {
+                'token': self.jwt_token,
+                'command': rel_file_cmd,
+                'timestamp': datetime.datetime.now().isoformat(),
+                'username': self.username
+            }
+            json_str = json.dumps(json_packet)
+            
+            # Encrypt and send
+            if self.aesgcm and self.session_id:
+                nonce = self._next_nonce()
+                ciphertext = self.aesgcm.encrypt(nonce, json_str.encode(), None)
+                encrypted_data = self.session_id + nonce + ciphertext
+                encrypted_b64 = base64.b64encode(encrypted_data).decode()
+            else:
+                encrypted_b64 = base64.b64encode(json_str.encode()).decode()
+            
+            self.sock.send(encrypted_b64.encode())
+            
+            # Wait for READY response (JSON)
+            response_data = self._recv_json_response()
+            if not response_data or response_data.get('command') != 'READY':
+                return False, f"Server not ready: {response_data}"
             
             # Send file content
             bytes_sent = 0
@@ -474,12 +684,12 @@ class TCPClient:
                         progress = (bytes_sent / file_size) * 100
                         progress_callback(progress, bytes_sent, file_size)
             
-            # Get transfer result
-            result = self.sock.recv(1024).decode()
-            if result.startswith('FILE_OK'):
+            # Get transfer result (JSON response)
+            result_response = self._recv_json_response()
+            if result_response and result_response.get('command') == 'FILE_OK':
                 return True, "File sent successfully"
             else:
-                return False, f"Transfer failed: {result}"
+                return False, f"Transfer failed: {result_response}"
             
         except Exception as e:
             return False, str(e)
@@ -491,44 +701,24 @@ class TCPClient:
         
         try:
             # Send LIST_FILES command
-            success, error = self._send_command('LIST_FILES')
+            success, error = self._send_json_command('LIST_FILES')
             if not success:
                 return False, error, None
             
-            # Receive response
-            response = self.sock.recv(1024).decode().strip()
+            # Receive response (JSON-encrypted)
+            response_data = self._recv_json_response()
             
-            if response == 'LIST_EMPTY':
+            if not response_data:
+                return False, "No response from server", None
+            
+            if response_data.get('command') == 'LIST_EMPTY':
                 return True, "No files on server", {'files': [], 'folders': []}
             
-            if not response.startswith('LIST_START'):
-                return False, f"Invalid response: {response}", None
+            if response_data.get('command') == 'LIST_OK':
+                files_list = response_data.get('data', {})
+                return True, f"List received: {len(files_list.get('files', []))} files, {len(files_list.get('folders', []))} folders", files_list
             
-            # Parse list size
-            parts = response.split()
-            if len(parts) != 2:
-                return False, "Invalid LIST_START format", None
-            
-            list_size = int(parts[1])
-            
-            # Send READY
-            self.sock.send(b'READY')
-            
-            # Receive list data
-            list_data = b''
-            while len(list_data) < list_size:
-                chunk = self.sock.recv(min(65536, list_size - len(list_data)))
-                if not chunk:
-                    break
-                list_data += chunk
-            
-            # Parse JSON
-            files_list = json.loads(list_data.decode())
-            
-            # Send confirmation
-            self.sock.send(b'LIST_OK')
-            
-            return True, f"List received: {len(files_list.get('files', []))} files, {len(files_list.get('folders', []))} folders", files_list
+            return False, f"Invalid response: {response_data}", None
             
         except Exception as e:
             logging.error(f"List files error: {e}")
@@ -542,29 +732,29 @@ class TCPClient:
         try:
             # Send DOWNLOAD_FILE command
             download_cmd = f'DOWNLOAD_FILE {filename}'
-            success, error = self._send_command(download_cmd)
+            success, error = self._send_json_command(download_cmd)
             if not success:
                 return False, error
             
-            # Receive response
-            response = self.sock.recv(1024).decode().strip()
+            # Receive response (JSON-encrypted)
+            response_data = self._recv_json_response()
             
-            if response == 'FILE_NOT_FOUND':
+            if not response_data:
+                return False, "No response from server"
+            
+            if response_data.get('command') == 'FILE_NOT_FOUND':
                 return False, f"File not found on server: {filename}"
             
-            if response == 'NOT_A_FILE':
+            if response_data.get('command') == 'NOT_A_FILE':
                 return False, f"Not a file: {filename}"
             
-            if not response.startswith('FILE_INFO'):
-                return False, f"Invalid response: {response}"
+            if response_data.get('command') != 'FILE_INFO':
+                return False, f"Invalid response: {response_data}"
             
-            # Parse file info: FILE_INFO <filename> <size> <checksum>
-            parts = response.split()
-            if len(parts) != 4:
-                return False, "Invalid FILE_INFO format"
-            
-            _, server_filename, file_size_str, expected_checksum = parts
-            file_size = int(file_size_str)
+            # Parse file info from JSON
+            server_filename = response_data.get('filename', filename)
+            file_size = response_data.get('size', 0)
+            expected_checksum = response_data.get('checksum', '')
             
             # Determine save path
             if save_path is None:
@@ -584,35 +774,36 @@ class TCPClient:
                 counter += 1
             
             # Send READY
-            self.sock.send(b'READY')
+            ready_msg = f'READY_UDP {self.client_udp_port}'
+            self.sock.send(ready_msg.encode())
             
-            # Receive file data
-            logging.info(f"Downloading {filename} ({file_size:,} bytes)...")
+            logging.info(f"Downloading (UDP/AES) {filename} ({file_size:,} bytes)...")
             bytes_received = 0
             file_hash = hashlib.sha256()
             start_time = time.time()
+            self.udp_sock.settimeout(30.0)
             
             with open(save_path, 'wb') as f:
                 while bytes_received < file_size:
-                    remaining = file_size - bytes_received
-                    chunk = self.sock.recv(min(65536, remaining))
-                    if not chunk:
+                    try:
+                        packet, addr = self.udp_sock.recvfrom(65536 + 64)
+                        if addr[0] != self.server_ip:
+                            continue
+                        chunk = self._decrypt_packet(packet)
+                        f.write(chunk)
+                        file_hash.update(chunk)
+                        bytes_received += len(chunk)
+                        
+                        if progress_callback:
+                            progress = (bytes_received / file_size) * 100
+                            progress_callback(progress, bytes_received, file_size)
+                    except socket.timeout:
+                        logging.error("UDP download timeout")
                         break
-                    
-                    f.write(chunk)
-                    file_hash.update(chunk)
-                    bytes_received += len(chunk)
-                    
-                    # Update progress
-                    if progress_callback:
-                        progress = (bytes_received / file_size) * 100
-                        progress_callback(progress, bytes_received, file_size)
             
-            # Verify checksum
             actual_checksum = file_hash.hexdigest()
             
-            if actual_checksum == expected_checksum:
-                # Send confirmation
+            if actual_checksum == expected_checksum and bytes_received == file_size:
                 self.sock.send(b'FILE_RECEIVED')
                 
                 transfer_time = time.time() - start_time
@@ -620,8 +811,9 @@ class TCPClient:
                 
                 return True, f"File downloaded: {save_path} ({speed:.2f} MB/s)"
             else:
-                os.remove(save_path)
-                return False, f"Checksum mismatch. Expected: {expected_checksum[:16]}..., Got: {actual_checksum[:16]}..."
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+                return False, f"Checksum mismatch or incomplete transfer. Expected: {expected_checksum[:16]}..., Got: {actual_checksum[:16]}..., bytes: {bytes_received}/{file_size}"
                 
         except Exception as e:
             logging.error(f"Download file error: {e}")
@@ -637,7 +829,7 @@ class TCPClient:
         try:
             # Send DOWNLOAD_FOLDER command
             download_cmd = f'DOWNLOAD_FOLDER {folder_name}'
-            success, error = self._send_command(download_cmd)
+            success, error = self._send_json_command(download_cmd)
             if not success:
                 return False, error
             
@@ -770,21 +962,24 @@ class TCPClient:
         try:
             # Send DELETE_FILE command
             delete_cmd = f'DELETE_FILE {filename}'
-            success, error = self._send_command(delete_cmd)
+            success, error = self._send_json_command(delete_cmd)
             if not success:
                 return False, error
             
-            # Receive response
-            response = self.sock.recv(1024).decode().strip()
+            # Receive response (JSON-encrypted)
+            response_data = self._recv_json_response()
             
-            if response.startswith('DELETE_OK'):
-                return True, response.replace('DELETE_OK ', '')
-            elif response.startswith('DELETE_FAIL'):
-                return False, response.replace('DELETE_FAIL ', '')
-            elif 'Permission denied' in response:
-                return False, "Permission denied: Admin only"
+            if not response_data:
+                return False, "No response from server"
+            
+            if response_data.get('command') == 'DELETE_OK':
+                return True, response_data.get('message', 'File deleted')
+            elif response_data.get('command') == 'DELETE_FAIL':
+                return False, response_data.get('message', 'Deletion failed')
+            elif response_data.get('status') == 'error':
+                return False, response_data.get('message', 'Error')
             else:
-                return False, f"Unexpected response: {response}"
+                return False, f"Unexpected response: {response_data}"
                 
         except Exception as e:
             logging.error(f"Delete file error: {e}")
@@ -798,21 +993,24 @@ class TCPClient:
         try:
             # Send DELETE_FOLDER command
             delete_cmd = f'DELETE_FOLDER {folder_name}'
-            success, error = self._send_command(delete_cmd)
+            success, error = self._send_json_command(delete_cmd)
             if not success:
                 return False, error
             
-            # Receive response
-            response = self.sock.recv(1024).decode().strip()
+            # Receive response (JSON-encrypted)
+            response_data = self._recv_json_response()
             
-            if response.startswith('DELETE_OK'):
-                return True, response.replace('DELETE_OK ', '')
-            elif response.startswith('DELETE_FAIL'):
-                return False, response.replace('DELETE_FAIL ', '')
-            elif 'Permission denied' in response:
-                return False, "Permission denied: Admin only"
+            if not response_data:
+                return False, "No response from server"
+            
+            if response_data.get('command') == 'DELETE_OK':
+                return True, response_data.get('message', 'Folder deleted')
+            elif response_data.get('command') == 'DELETE_FAIL':
+                return False, response_data.get('message', 'Deletion failed')
+            elif response_data.get('status') == 'error':
+                return False, response_data.get('message', 'Error')
             else:
-                return False, f"Unexpected response: {response}"
+                return False, f"Unexpected response: {response_data}"
                 
         except Exception as e:
             logging.error(f"Delete folder error: {e}")
@@ -826,21 +1024,24 @@ class TCPClient:
         try:
             # Send RENAME_FILE command
             rename_cmd = f'RENAME_FILE {old_name} {new_name}'
-            success, error = self._send_command(rename_cmd)
+            success, error = self._send_json_command(rename_cmd)
             if not success:
                 return False, error
             
-            # Receive response
-            response = self.sock.recv(1024).decode().strip()
+            # Receive response (JSON-encrypted)
+            response_data = self._recv_json_response()
             
-            if response.startswith('RENAME_OK'):
-                return True, response.replace('RENAME_OK ', '')
-            elif response.startswith('RENAME_FAIL'):
-                return False, response.replace('RENAME_FAIL ', '')
-            elif 'Permission denied' in response:
-                return False, "Permission denied: Admin only"
+            if not response_data:
+                return False, "No response from server"
+            
+            if response_data.get('command') == 'RENAME_OK':
+                return True, response_data.get('message', 'File renamed')
+            elif response_data.get('command') == 'RENAME_FAIL':
+                return False, response_data.get('message', 'Rename failed')
+            elif response_data.get('status') == 'error':
+                return False, response_data.get('message', 'Error')
             else:
-                return False, f"Unexpected response: {response}"
+                return False, f"Unexpected response: {response_data}"
                 
         except Exception as e:
             logging.error(f"Rename file error: {e}")
@@ -854,21 +1055,24 @@ class TCPClient:
         try:
             # Send RENAME_FOLDER command
             rename_cmd = f'RENAME_FOLDER {old_name} {new_name}'
-            success, error = self._send_command(rename_cmd)
+            success, error = self._send_json_command(rename_cmd)
             if not success:
                 return False, error
             
-            # Receive response
-            response = self.sock.recv(1024).decode().strip()
+            # Receive response (JSON-encrypted)
+            response_data = self._recv_json_response()
             
-            if response.startswith('RENAME_OK'):
-                return True, response.replace('RENAME_OK ', '')
-            elif response.startswith('RENAME_FAIL'):
-                return False, response.replace('RENAME_FAIL ', '')
-            elif 'Permission denied' in response:
-                return False, "Permission denied: Admin only"
+            if not response_data:
+                return False, "No response from server"
+            
+            if response_data.get('command') == 'RENAME_OK':
+                return True, response_data.get('message', 'Folder renamed')
+            elif response_data.get('command') == 'RENAME_FAIL':
+                return False, response_data.get('message', 'Rename failed')
+            elif response_data.get('status') == 'error':
+                return False, response_data.get('message', 'Error')
             else:
-                return False, f"Unexpected response: {response}"
+                return False, f"Unexpected response: {response_data}"
                 
         except Exception as e:
             logging.error(f"Rename folder error: {e}")

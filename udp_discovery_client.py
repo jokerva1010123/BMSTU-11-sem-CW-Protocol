@@ -68,12 +68,12 @@ class UDPDiscoveryClient:
             if self.sock:
                 self.sock.close()
     
-    def get_server_list(self):
-        """Возвращает список серверов в текстовом формате"""
-        servers_text = []
-        for i, server in enumerate(self.discovered_servers, 1):
-            servers_text.append(f"{i}. {server['name']} - {server['ip']}:{server['tcp_port']}")
-        return servers_text
+    # def get_server_list(self):
+    #     """Возвращает список серверов в текстовом формате"""
+    #     servers_text = []
+    #     for i, server in enumerate(self.discovered_servers, 1):
+    #         servers_text.append(f"{i}. {server['name']} - {server['ip']}:{server['tcp_port']}")
+    #     return servers_text
 
 if __name__ == "__main__":
     client = UDPDiscoveryClient(timeout=3)

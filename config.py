@@ -15,6 +15,10 @@ LARGE_FILE_THRESHOLD =  100 * 1024 * 1024
 CHUNK_SIZE = 65536         # Chunk size for transfer
 BUFFER_SIZE = 131072          # Buffer size
 
+# UDP settings
+# Keep this small to avoid fragmentation (AES-GCM adds 16 bytes tag + we prepend 16 bytes session+nonce)
+UDP_PLAINTEXT_CHUNK_SIZE = 1200
+
 # Paths
 UPLOAD_DIR = "uploads"    # Directory for uploaded files
 LOG_DIR = "logs"          # Directory for logs
