@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-GUI Client - Графический интерфейс для LFTP клиента
-"""
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import threading
@@ -112,7 +109,6 @@ class LFTPClientGUI:
             show='headings',
             height=6
         )
-        
         # Настройка столбцов
         self.devices_tree.heading('name', text='Server name')
         self.devices_tree.heading('ip', text='IP address')
@@ -121,14 +117,12 @@ class LFTPClientGUI:
         self.devices_tree.column('name', width=200)
         self.devices_tree.column('ip', width=150)
         self.devices_tree.column('port', width=80)
-        
         # Полоса прокрутки
         scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.devices_tree.yview)
         self.devices_tree.configure(yscrollcommand=scrollbar.set)
         
         self.devices_tree.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
-        
         # Привязка события выбора
         self.devices_tree.bind('<<TreeviewSelect>>', self.on_server_select)
     
@@ -274,7 +268,6 @@ class LFTPClientGUI:
             show='headings',
             height=8
         )
-        
         # Настройка столбцов
         self.files_tree.heading('name', text='Name')
         self.files_tree.heading('type', text='Type')
@@ -424,10 +417,8 @@ class LFTPClientGUI:
         file_path = filedialog.askopenfilename(
             title="Select file to transfer"
         )
-        
         if not file_path:
             return
-        
         # Запуск передачи в отдельном потоке
         thread = threading.Thread(
             target=self._transfer_file_thread,
@@ -583,7 +574,7 @@ class LFTPClientGUI:
         # Создаем диалоговое окно
         auth_dialog = tk.Toplevel(self.root)
         auth_dialog.title("Login")
-        auth_dialog.geometry("300x150")
+        auth_dialog.geometry("300x170")
         auth_dialog.resizable(False, False)
         auth_dialog.transient(self.root)
         auth_dialog.grab_set()
@@ -665,6 +656,7 @@ class LFTPClientGUI:
             
             # Передача файла
             success, message = client.send_file(file_path, update_progress)
+            # success, message = client.send_file(file_path)
             
             if success:
                 self.log(f"✓ {message}")

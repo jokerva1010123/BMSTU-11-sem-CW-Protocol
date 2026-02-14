@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""
-TCP File Server - Сервер для приема файлов с аутентификацией и проверкой целостности
-"""
 import socket
 import threading
 import json
 import hashlib
 import os
 import logging
+import time
 import shutil
 import datetime
-from config import TCP_PORT, UDP_DATA_PORT, MAX_FILE_SIZE, UPLOAD_DIR
+import zipfile
+import tempfile
+from config import TCP_PORT, UDP_DATA_PORT, UPLOAD_DIR
 import jwt
 from config import JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRATION_HOURS
 import os
@@ -45,27 +45,14 @@ class TCPServer:
             os.makedirs(UPLOAD_DIR)
     
     def load_users(self):
-        """Загружает пользователей из JSON файла"""
         try:
-            if os.path.exists('user_db.json'):
-                with open('user_db.json', 'r') as f:
-                    return json.load(f)
-            else:
-                # Создаем тестовых пользователей
-                default_users = {
-                    'admin': hashlib.sha256(b'admin123').hexdigest(),
-                    'user': hashlib.sha256(b'password').hexdigest(),
-                    'test': hashlib.sha256(b'test123').hexdigest()
-                }
-                with open('user_db.json', 'w') as f:
-                    json.dump(default_users, f, indent=2)
-                return default_users
+            with open('user_db.json', 'r') as f:
+                return json.load(f)
         except Exception as e:
             logging.error(f"Error loading users: {e}")
             return {}
     
     def verify_jwt(self, token):
-        """Verifies JWT token and returns user info"""
         try:
             payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
             return payload
@@ -75,12 +62,9 @@ class TCPServer:
             return None  # Invalid token
     
     def _send_json_response(self, conn, response_data: dict, session_info) -> bool:
-        """Gửi response dưới dạng JSON mã hóa với AES-GCM"""
         try:
-            # Chuyển sang JSON string
             json_str = json.dumps(response_data)
             
-            # Mã hóa JSON với AES-GCM
             if session_info and 'aesgcm' in session_info:
                 nonce_prefix = session_info.setdefault('response_nonce_prefix', os.urandom(4))
                 nonce_counter = session_info.setdefault('response_nonce_counter', 0)
@@ -95,55 +79,57 @@ class TCPServer:
                 encrypted_data = session_id + nonce + ciphertext
                 encrypted_b64 = base64.b64encode(encrypted_data).decode()
             else:
-                # Base64 nếu chưa có session key
                 encrypted_b64 = base64.b64encode(json_str.encode()).decode()
             
-            # Gửi dữ liệu mã hóa
             conn.send(encrypted_b64.encode())
             return True
         except Exception as e:
             logging.error(f"Error sending JSON response: {e}")
             return False
-    
-    def _log_command_to_json(self, command: str, encrypted_command: str, username: str, status: str = 'received', client_ip: str = ''):
-        """Ghi lệnh vào file JSON trên server"""
+        
+    def _recv_json_response(self, conn, session_info):
         try:
-            log_file = 'commands_received_log.json'
+            encrypted_data_b64 = conn.recv(4096).decode().strip()
+            if not encrypted_data_b64:
+                return None
             
-            # Tải log hiện tại
-            commands_log = []
-            if os.path.exists(log_file):
-                with open(log_file, 'r', encoding='utf-8') as f:
-                    try:
-                        commands_log = json.load(f)
-                    except:
-                        commands_log = []
+            encrypted_data = base64.b64decode(encrypted_data_b64)
             
-            # Thêm entry mới
-            log_entry = {
-                'timestamp': datetime.datetime.now().isoformat(),
-                'username': username,
-                'original_command': command,
-                'encrypted_command': encrypted_command,
-                'status': status,
-                'client_ip': client_ip
-            }
-            commands_log.append(log_entry)
+            if session_info and 'aesgcm' in session_info:
+                session_id = session_info['session_id']
+                aesgcm = session_info['aesgcm']
+                
+                if len(encrypted_data) < 4 + 12:
+                    logging.error("Encrypted data too short")
+                    return None
+                
+                pkt_session = encrypted_data[:4]
+                if pkt_session != session_id:
+                    logging.error("Session mismatch in decryption")
+                    return None
             
-            # Lưu vào file
-            with open(log_file, 'w', encoding='utf-8') as f:
-                json.dump(commands_log, f, indent=2, ensure_ascii=False)
+                nonce = encrypted_data[4:16]
+                ciphertext = encrypted_data[16:]
+                
+                try:
+                    json_str = aesgcm.decrypt(nonce, ciphertext, None).decode('utf-8')
+                except Exception as e:
+                    logging.error(f"Decryption error: {e}")
+                    return None
+            else:
+                json_str = encrypted_data.decode('utf-8')
             
-            logging.info(f"Command logged to {log_file}")
+            response_data = json.loads(json_str)
+            return response_data
         except Exception as e:
-            logging.error(f"Error logging command on server: {e}")
+            logging.error(f"Error receiving JSON response from client: {e}")
+            return None
     
     def authenticate(self, conn, addr):
         """Выполняет аутентификацию клиента"""
         try:
             conn.send(b'AUTH_REQUIRED')
             
-            # Получаем учетные данные
             auth_data = conn.recv(1024).decode().strip()
             if not auth_data:
                 return False, "Empty data"
@@ -154,11 +140,9 @@ class TCPServer:
             
             username, password_hash = parts[1], parts[2]
             
-            # Проверяем пользователя
             if username in self.users:
                 stored_hash = self.users[username]
                 if stored_hash == password_hash:
-                    # Generate JWT token
                     expiration = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=JWT_EXPIRATION_HOURS)
                     token_payload = {
                         'username': username,
@@ -176,13 +160,12 @@ class TCPServer:
             else:
                 conn.send(b'AUTH_FAIL:User not found')
                 return False, "User not found"
-                
         except Exception as e:
             logging.error(f"Authentication error: {e}")
             return False, str(e)
 
     def perform_handshake(self, conn, addr):
-        """3-step X25519 handshake: receive client pub, send server pub, derive AES key"""
+        """3-step X25519 handshake"""
         try:
             data = conn.recv(2048).decode().strip()
             if not data.startswith("KEYEX"):
@@ -229,230 +212,296 @@ class TCPServer:
         except Exception as e:
             logging.error(f"Handshake error with {addr}: {e}")
             return None
-        
-    def receive_streaming_file(self, conn, client_ip, filename, expected_size, session_info):
-        """
-        Прием больших файлов потоковым способом
-        """
-        try:
-            file_path = os.path.join(UPLOAD_DIR, filename)
-            
-            # Уникальное имя файла
-            counter = 1
-            name, ext = os.path.splitext(filename)
-            while os.path.exists(file_path):
-                filename = f"{name}_{counter}{ext}"
-                file_path = os.path.join(UPLOAD_DIR, filename)
-                counter += 1
-            
-            # Отправляем подтверждение готовности
-            ready_stream_response = {"status": "ok", "command": "READY_STREAM"}
-            self._send_json_response(conn, ready_stream_response, session_info)
-            logging.info(f"Receiving streaming file: {filename} ({expected_size} bytes)")
-            
-            # Начинаем прием потоковым способом
-            bytes_received = 0
-            file_hash = hashlib.sha256()
-            expected_size_int = int(expected_size)
-            
-            with open(file_path, 'wb') as f:
-                # Устанавливаем таймаут для операций чтения
-                conn.settimeout(30.0)
-                
-                while bytes_received < expected_size_int:
-                    try:
-                        # Получаем размер следующего чанка (4 байта)
-                        header = conn.recv(4)
-                        if len(header) < 4:
-                            if bytes_received >= expected_size_int:
-                                break  # Файл полностью получен
-                            else:
-                                raise ConnectionError("Incomplete header received")
-                        
-                        chunk_size = int.from_bytes(header, 'big')
-                        
-                        # Получаем сам чанк
-                        chunk_received = 0
-                        chunk_data = bytearray()
-                        
-                        while chunk_received < chunk_size:
-                            remaining = chunk_size - chunk_received
-                            # Читаем не более 64KB за раз
-                            part = conn.recv(min(65536, remaining))
-                            if not part:
-                                raise ConnectionError("Connection closed during chunk transfer")
-                            
-                            chunk_data.extend(part)
-                            chunk_received += len(part)
-                        
-                        # Записываем чанк и обновляем хеш
-                        f.write(chunk_data)
-                        file_hash.update(chunk_data)
-                        bytes_received += chunk_received
-                        
-                        # Логируем прогресс каждые 100MB
-                        if bytes_received % (100 * 1024 * 1024) < chunk_received:
-                            progress = (bytes_received / expected_size_int) * 100
-                            mb_received = bytes_received / (1024 * 1024)
-                            mb_total = expected_size_int / (1024 * 1024)
-                            logging.info(f"Received: {mb_received:.1f}/{mb_total:.1f} MB ({progress:.1f}%)")
-                            
-                    except socket.timeout:
-                        logging.warning(f"Socket timeout, received {bytes_received}/{expected_size} bytes")
-                        # Проверяем, может файл уже полностью получен?
-                        if bytes_received >= expected_size_int:
-                            break
-                        # Иначе продолжаем попытки
-                        continue
-            
-            # Ждем финальный хеш от клиента
-            try:
-                hash_data = conn.recv(1024).decode('utf-8', errors='ignore')
-            except:
-                hash_data = ""
-                
-            if hash_data.startswith('FILE_HASH'):
-                client_hash = hash_data.split()[1]
-                server_hash = file_hash.hexdigest()
-                
-                if client_hash == server_hash:
-                    logging.info(f"Streaming file received successfully: {filename}")
-                    file_ok_response = {"status": "ok", "command": "FILE_OK", "hash": server_hash[:16]}
-                    self._send_json_response(conn, file_ok_response, session_info)
-                    return True, f"File received: {bytes_received} bytes"
-                else:
-                    logging.error(f"Hash mismatch for streaming file {filename}")
-                    logging.error(f"Client hash: {client_hash[:32]}...")
-                    logging.error(f"Server hash: {server_hash[:32]}...")
-                    
-                    # Сохраняем файл для анализа, но отмечаем как проблемный
-                    corrupted_path = file_path + ".corrupted"
-                    os.rename(file_path, corrupted_path)
-                    corrupted_response = {"status": "error", "command": "FILE_CORRUPTED", "server_hash": server_hash}
-                    self._send_json_response(conn, corrupted_response, session_info)
-                    return False, "Hash mismatch - file saved as .corrupted"
-            else:
-                # Если хеш не получен, вычисляем его из полученного файла
-                server_hash = file_hash.hexdigest()
-                if bytes_received == expected_size_int:
-                    logging.warning(f"No hash received, but file size matches. Hash: {server_hash[:16]}...")
-                    file_ok_response = {"status": "ok", "command": "FILE_OK", "hash": server_hash}
-                    self._send_json_response(conn, file_ok_response, session_info)
-                    return True, f"File received without hash verification: {bytes_received} bytes"
-                else:
-                    logging.error(f"Incomplete transfer: {bytes_received}/{expected_size_int} bytes")
-                    os.remove(file_path)
-                    incomplete_response = {"status": "error", "command": "FILE_INCOMPLETE", "received": bytes_received, "expected": expected_size_int}
-                    self._send_json_response(conn, incomplete_response, session_info)
-                    return False, f"Incomplete transfer: {bytes_received}/{expected_size_int}"
-                
-        except Exception as e:
-            logging.error(f"Streaming file receive error: {e}")
-            if 'file_path' in locals() and os.path.exists(file_path):
-                os.remove(file_path)
-            return False, str(e)
-        finally:
-            # Восстанавливаем стандартный таймаут
-            conn.settimeout(None)
     
+    def handle_folder_zip(self, conn, client_ip, folder_name, size, checksum, session_info):
+        try:
+            success, message = self.receive_file(conn, client_ip, f"{folder_name}.zip", size, checksum, session_info)
+            if not success:
+                return False, message
+            
+            zip_path = os.path.join(UPLOAD_DIR, f"{folder_name}.zip")
+            
+            base_folder = folder_name
+            counter = 1
+            extract_path = os.path.join(UPLOAD_DIR, folder_name)
+            while os.path.exists(extract_path):
+                folder_name = f"{base_folder}_{counter}"
+                extract_path = os.path.join(UPLOAD_DIR, folder_name)
+                counter += 1
+            
+            os.makedirs(extract_path, exist_ok=True)
+            
+            with zipfile.ZipFile(zip_path, 'r') as zipf:
+                zipf.extractall(extract_path)
+            
+            os.remove(zip_path)
+            logging.info(f"Folder {folder_name} unzipped successfully")
+            return True, f"Folder received and unzipped: {folder_name}"
+        except Exception as e:
+            logging.error(f"Folder zip handle error: {e}")
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            if os.path.exists(extract_path):
+                shutil.rmtree(extract_path)
+            return False, str(e)
+        
     def receive_file(self, conn, client_ip, filename, expected_size, expected_checksum, session_info):
-        """Принимает файл и проверяет целостность"""
         try:
             file_path = os.path.join(UPLOAD_DIR, filename)
-            
-            # Проверяем, не существует ли файл
             counter = 1
             name, ext = os.path.splitext(filename)
             while os.path.exists(file_path):
                 filename = f"{name}_{counter}{ext}"
                 file_path = os.path.join(UPLOAD_DIR, filename)
                 counter += 1
-            
-            # Gửi READY_UDP dưới dạng JSON mã hóa
+
             response = {"status": "ok", "command": "READY_UDP"}
             self._send_json_response(conn, response, session_info)
-            logging.info(f"Receiving encrypted UDP file: {filename} ({expected_size} bytes)")
 
-            received_data = bytearray()
+            logging.info(f"Receiving reliable UDP file: {filename} ({expected_size} bytes)")
+
+            expected_seq = 0
+            received_chunks = {}          
+            max_received = -1
             bytes_received = 0
-            # Must be small enough for UDP
-            chunk_size = UDP_PLAINTEXT_CHUNK_SIZE
-            self.udp_socket.settimeout(90)
-            session_id = session_info['session_id']
-            aesgcm = session_info['aesgcm']
+            f = open(file_path, 'wb')     
+
+            self.udp_socket.settimeout(40.0)
 
             while bytes_received < int(expected_size):
                 try:
-                    # packet overhead: 4(session) + 12(nonce) + 16(tag) ~= 32 bytes
-                    packet, addr = self.udp_socket.recvfrom(chunk_size + 64)
+                    packet, addr = self.udp_socket.recvfrom(UDP_PLAINTEXT_CHUNK_SIZE + 64)
                     if addr[0] != client_ip:
                         continue
-                    if not packet.startswith(session_id):
+                    if not packet.startswith(session_info['session_id']):
                         continue
-                    nonce = packet[4:16]
-                    ciphertext = packet[16:]
+
+                    seq_bytes = packet[4:8]
+                    seq = int.from_bytes(seq_bytes, 'big')
+
+                    if seq == 0xFFFFFFFF:
+                        logging.info("Received END marker")
+                        break
+
+                    nonce = packet[8:20]
+                    ciphertext = packet[20:]
+
                     try:
-                        chunk = aesgcm.decrypt(nonce, ciphertext, None)
-                    except Exception as decrypt_error:
-                        logging.error(f"Decrypt error: {decrypt_error}")
+                        chunk = session_info['aesgcm'].decrypt(nonce, ciphertext, None)
+                    except Exception as e:
+                        logging.warning(f"Decrypt error seq {seq}: {e}")
                         continue
-                    received_data.extend(chunk)
-                    bytes_received += len(chunk)
-                    # Gửi ACK dưới dạng JSON mã hóa
-                    ack_response = {"status": "ok", "command": "ACK", "bytes_received": bytes_received}
-                    self._send_json_response(conn, ack_response, session_info)
+
+                    if seq not in received_chunks:
+                        received_chunks[seq] = chunk
+                        max_received = max(max_received, seq)
+                        bytes_received += len(chunk)
+
+                    while expected_seq in received_chunks:
+                        chunk_data = received_chunks.pop(expected_seq)
+                        f.write(chunk_data)
+                        expected_seq += 1
+
+                    ack_msg = f"ACK {expected_seq - 1}".encode()
+                    self.udp_socket.sendto(ack_msg, (client_ip, addr[1])) 
+
                 except socket.timeout:
-                    logging.error("UDP receive timeout")
-                    break
-            
-            # Проверяем целостность
-            actual_checksum = hashlib.sha256(received_data).hexdigest()
-            
-            if actual_checksum == expected_checksum:
-                # Сохраняем файл
-                with open(file_path, 'wb') as f:
-                    f.write(received_data)
-                
-                # Сохраняем метаданные
-                metadata = {
-                    'original_name': filename,
-                    'size': bytes_received,
-                    'checksum': actual_checksum,
-                    'received_at': datetime.datetime.now().isoformat()
-                }
-                
-                meta_path = file_path + '.meta'
-                with open(meta_path, 'w') as f:
-                    json.dump(metadata, f, indent=2)
-                
-                logging.info(f"File saved: {file_path}")
-                # Gửi FILE_OK dưới dạng JSON mã hóa
-                ok_response = {"status": "ok", "command": "FILE_OK", "checksum": actual_checksum}
-                self._send_json_response(conn, ok_response, session_info)
-                return True, f"File received successfully. Hash: {actual_checksum[:16]}..."
+                    if expected_seq > 0:
+                        ack_msg = f"ACK {expected_seq - 1}".encode()
+                        self.udp_socket.sendto(ack_msg, (client_ip, self.udp_data_port))
+
+            f.close()
+
+            # Проверка
+            if expected_seq * UDP_PLAINTEXT_CHUNK_SIZE >= int(expected_size) or bytes_received >= int(expected_size):
+                actual_checksum = hashlib.sha256()
+                with open(file_path, 'rb') as f_check:
+                    while chunk := f_check.read(8192):
+                        actual_checksum.update(chunk)
+                actual_hex = actual_checksum.hexdigest()
+
+                if actual_hex == expected_checksum:
+                    ok_response = {"status": "ok", "command": "FILE_OK", "checksum": actual_hex}
+                    self._send_json_response(conn, ok_response, session_info)
+                    return True, "File received reliably"
+                else:
+                    logging.error(f"Checksum mismatch after reliable transfer")
+                    corrupted_response = {"status": "error", "command": "FILE_CORRUPTED"}
+                    self._send_json_response(conn, corrupted_response, session_info)
+                    return False, "Checksum mismatch"
             else:
-                logging.error(f"Integrity error. Expected: {expected_checksum[:16]}..., Got: {actual_checksum[:16]}...")
-                # Gửi FILE_CORRUPTED dưới dạng JSON mã hóa
-                corrupted_response = {"status": "error", "command": "FILE_CORRUPTED", "received_hash": actual_checksum}
-                self._send_json_response(conn, corrupted_response, session_info)
-                return False, "Data integrity error"
-                
+                incomplete_response = {"status": "error", "command": "FILE_INCOMPLETE", "received": bytes_received}
+                self._send_json_response(conn, incomplete_response, session_info)
+                return False, f"Incomplete: {bytes_received}/{expected_size}"
         except Exception as e:
-            logging.error(f"Error receiving file: {e}")
-            # Gửi FILE_ERROR dưới dạng JSON mã hóa
-            error_response = {"status": "error", "command": "FILE_ERROR", "message": str(e)}
+            logging.error(f"Reliable receive error: {e}")
+            if 'f' in locals():
+                f.close()
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            return False, str(e)
+        
+    def send_file_to_client(self, conn, filename, session_info, client_ip):
+        try:
+            file_path = os.path.join(UPLOAD_DIR, filename)
+            if not os.path.exists(file_path):
+                return False, f"File not found: {filename}"
+            if not os.path.isfile(file_path):
+                return False, f"Not a file: {filename}"
+            
+            file_size = os.path.getsize(file_path)
+            
+            file_checksum = hashlib.sha256()
+            with open(file_path, 'rb') as f:
+                while chunk := f.read(8192):
+                    file_checksum.update(chunk)
+            checksum_hex = file_checksum.hexdigest()
+            
+            ready_response = {
+                "status": "ok",
+                "command": "DOWNLOAD_READY",
+                "filename": filename,
+                "size": file_size,
+                "checksum": checksum_hex
+            }
+            self._send_json_response(conn, ready_response, session_info)
+            
+            try:
+                udp_port_msg = conn.recv(1024).decode().strip()
+                if udp_port_msg.startswith('UDP_PORT'):
+                    client_udp_port = int(udp_port_msg.split()[1])
+                    client_addr = (client_ip, client_udp_port)
+                    logging.info(f"Client UDP port for file download: {client_udp_port}")
+                else:
+                    return False, "Client did not send UDP_PORT"
+            except Exception as e:
+                logging.error(f"Failed to receive client UDP port: {e}")
+                return False, "Failed to get client UDP port"
+            
+            logging.info(f"Sending file to {client_ip}:{client_udp_port} - {filename} ({file_size} bytes)")
+            
+            WINDOW_SIZE = 64
+            RETRANSMIT_TIMEOUT = 0.5
+            MAX_RETRIES_PER_PACKET = 5
+            
+            with open(file_path, 'rb') as f:
+                base = 0
+                next_seq = 0
+                packets_in_flight = {}
+                done = False
+                transfer_start = time.time()
+                
+                def next_nonce():
+                    if 'download_nonce_counter' not in session_info:
+                        session_info['download_nonce_prefix'] = os.urandom(4)
+                        session_info['download_nonce_counter'] = 0
+                    prefix = session_info['download_nonce_prefix']
+                    cnt = session_info['download_nonce_counter']
+                    nonce = prefix + cnt.to_bytes(8, 'big')
+                    session_info['download_nonce_counter'] += 1
+                    return nonce
+                
+                def send_packet(seq, data: bytes):
+                    nonce = next_nonce()
+                    ciphertext = session_info['aesgcm'].encrypt(nonce, data, None)
+                    header = session_info['session_id'] + seq.to_bytes(4, 'big')
+                    packet = header + nonce + ciphertext
+                    self.udp_socket.sendto(packet, client_addr)
+                    return time.time()
+                
+                def retransmit_loop():
+                    nonlocal done
+                    while not done:
+                        time.sleep(0.1)
+                        now = time.time()
+                        with lock:
+                            for seq in list(packets_in_flight.keys()):
+                                if seq < base:
+                                    continue
+                                info = packets_in_flight[seq]
+                                if now - info['sent_time'] > RETRANSMIT_TIMEOUT:
+                                    if info['retries'] >= MAX_RETRIES_PER_PACKET:
+                                        logging.error(f"Max retries exceeded for seq {seq} → aborting")
+                                        done = True
+                                        return
+                                    # Re-send
+                                    send_packet(seq, info['data'])
+                                    info['sent_time'] = now
+                                    info['retries'] += 1
+                                    logging.debug(f"Retransmitted seq {seq} (retry {info['retries']})")
+                
+                lock = threading.Lock()
+                retransmit_thread = threading.Thread(target=retransmit_loop, daemon=True)
+                retransmit_thread.start()
+                
+                bytes_sent = 0
+                
+                while not done:
+                    with lock:
+                        while next_seq < base + WINDOW_SIZE:
+                            chunk = f.read(UDP_PLAINTEXT_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            sent_time = send_packet(next_seq, chunk)
+                            packets_in_flight[next_seq] = {
+                                'data': chunk,
+                                'sent_time': sent_time,
+                                'retries': 0
+                            }
+                            next_seq += 1
+                            bytes_sent += len(chunk)
+                    
+                    try:
+                        self.udp_socket.settimeout(0.05)
+                        ack_packet, addr = self.udp_socket.recvfrom(1024)
+                        if addr[0] != client_ip:
+                            continue
+                        
+                        ack_str = ack_packet.decode(errors='ignore').strip()
+                        if ack_str.startswith('ACK '):
+                            try:
+                                ack_seq = int(ack_str.split()[1])
+                                with lock:
+                                    if ack_seq >= base - 1:
+                                        base = ack_seq + 1
+                                        for s in range(base):
+                                            packets_in_flight.pop(s, None)
+                            except (ValueError, IndexError):
+                                logging.warning(f"Invalid ACK format: {ack_str}")
+                    except socket.timeout:
+                        pass
+                    
+                    if bytes_sent >= file_size and base >= next_seq:
+                        done = True
+                
+                end_header = session_info['session_id'] + (0xFFFFFFFF).to_bytes(4, 'big')
+                self.udp_socket.sendto(end_header + b'END', client_addr)
+                
+                retransmit_thread.join(timeout=3.0)
+                done = True
+                
+                transfer_time = time.time() - transfer_start
+                speed = file_size / transfer_time / 1024 / 1024 if transfer_time > 0 else 0  # MB/s
+                
+                complete_response = {
+                    "status": "ok",
+                    "command": "FILE_OK",
+                    "message": f"File sent successfully ({speed:.2f} MB/s)"
+                }
+                self._send_json_response(conn, complete_response, session_info)
+                return True, f"File sent: {filename} ({speed:.2f} MB/s)"
+        except Exception as e:
+            logging.error(f"send_file_to_client error: {e}", exc_info=True)
+            error_response = {"status": "error", "message": str(e)}
             self._send_json_response(conn, error_response, session_info)
             return False, str(e)
     
     def handle_client(self, conn, addr):
-        """Обрабатывает соединение с клиентом"""
         client_id = f"{addr[0]}:{addr[1]}"
         self.clients.append(client_id)
         username = None
-        
         try:
             logging.info(f"New connection from {client_id}")
-            
             session_info = self.perform_handshake(conn, addr)
             if not session_info:
                 conn.close()
@@ -466,24 +515,18 @@ class TCPServer:
             
             username = auth_message
             
-            # Send UDP data port to client (plain text - before main command loop)
             conn.send(f'UDP_PORT {UDP_DATA_PORT}'.encode())
             logging.info(f"Sent UDP data port {UDP_DATA_PORT} to {client_id}")
             
-            # Основной цикл обработки команд (JSON мã hóa)
             while True:
                 try:
-                    # Получаем JSON данные мã hóa (base64)
                     encrypted_data_b64 = conn.recv(4096).decode().strip()
                     if not encrypted_data_b64:
                         break
                     
-                    # Giải mã JSON packet
                     encrypted_data = base64.b64decode(encrypted_data_b64)
                     
-                    # Kiểm tra có dùng AES-GCM hay base64 thôi
                     if session_info and 'aesgcm' in session_info:
-                        # Giải mã AES-GCM
                         session_id = session_info['session_id']
                         aesgcm = session_info['aesgcm']
                         
@@ -505,25 +548,19 @@ class TCPServer:
                             json_str = aesgcm.decrypt(nonce, ciphertext, None).decode('utf-8')
                         except Exception as e:
                             logging.error(f"Decryption error: {e}")
-                            self._log_command_to_json('', encrypted_data_b64, username, 'decryption_failed', addr[0])
                             error_response = {"status": "error", "message": "Decryption failed"}
                             self._send_json_response(conn, error_response, session_info)
                             continue
                     else:
-                        # Base64 thôi (chưa có session key)
                         json_str = encrypted_data.decode('utf-8')
                     
-                    # Parse JSON
                     json_packet = json.loads(json_str)
                     
-                    # Lấy JWT token từ JSON
                     jwt_token = json_packet.get('token', '')
                     command = json_packet.get('command', '')
                     
-                    # Xác minh JWT
                     token_payload = self.verify_jwt(jwt_token)
                     if not token_payload:
-                        self._log_command_to_json(command, encrypted_data_b64, 'unknown', 'auth_failed', addr[0])
                         error_response = {"status": "error", "message": "Invalid or expired token"}
                         self._send_json_response(conn, error_response, session_info)
                         logging.warning(f"Invalid JWT token from {client_id}")
@@ -532,8 +569,6 @@ class TCPServer:
                     username = token_payload['username']
                     is_admin = token_payload.get('is_admin', False)
                     
-                    # Log lệnh nhận được
-                    self._log_command_to_json(command, encrypted_data_b64, username, 'received', addr[0])
                     logging.info(f"Command from {username}: {command[:50]}...")
 
                     if command.startswith('FILE'):
@@ -549,41 +584,22 @@ class TCPServer:
                         else:
                             error_response = {"status": "error", "message": "Invalid FILE command format"}
                             self._send_json_response(conn, error_response, session_info)
-                    elif command.startswith('STREAM_FILE'):
-                        # Формат: STREAM_FILE <filename> <size>
-                        cmd_parts = command.split()
-                        if len(cmd_parts) == 3:
-                            _, filename, size = cmd_parts
-                            success, message = self.receive_streaming_file(conn, addr[0], filename, size, session_info)
-                            error_response = {"status": "error", "message": "Invalid STREAM_FILE command format"}
-                            self._send_json_response(conn, error_response, session_info)
 
-                    elif command.startswith('FOLDER_START'):
-                        # Format: FOLDER_START <folder_name> <file_count>
+                    elif command.startswith('FOLDER_ZIP'):
+                        # Format: FOLDER_ZIP <folder_name> <size> <checksum>
                         cmd_parts = command.split()
-                        if len(cmd_parts) == 3:
-                            _, folder_name, file_count = cmd_parts
-                            success, message = self.handle_folder_transfer(conn, folder_name, file_count, session_info)
+                        if len(cmd_parts) == 4:
+                            _, folder_name, size, checksum = cmd_parts
+                            success, message = self.handle_folder_zip(conn, addr[0], folder_name, size, checksum, session_info)
                             if success:
-                                logging.info(f"Folder from {username} received: {message}")
+                                logging.info(f"Folder from {username} processed: {message}")
                             else:
-                                logging.error(f"Folder receive error from {username}: {message}")
+                                logging.error(f"Folder processing error from {username}: {message}")
                         else:
-                            error_response = {"status": "error", "message": "Invalid FOLDER_START command"}
+                            error_response = {"status": "error", "message": "Invalid FOLDER_ZIP command format"}
                             self._send_json_response(conn, error_response, session_info)
-
-                    elif command.startswith('REL_FILE'):
-                        # This is handled within handle_folder_transfer
-                        # But we need to acknowledge it
-                        ready_response = {"status": "ok", "command": "READY"}
-                        self._send_json_response(conn, ready_response, session_info)
-
-                    elif command == 'FOLDER_END':
-                        # This is handled within receive_folder
-                        pass
                     
                     elif command == 'LIST_FILES':
-                        # List all files and folders in uploads directory
                         success, message = self.list_files(conn, session_info)
                         if success:
                             logging.info(f"File list sent to {username}")
@@ -595,7 +611,7 @@ class TCPServer:
                         cmd_parts = command.split()
                         if len(cmd_parts) == 2:
                             _, filename = cmd_parts
-                            success, message = self.send_file_to_client(conn, filename, session_info)
+                            success, message = self.send_file_to_client(conn, filename, session_info, addr[0])
                             if success:
                                 logging.info(f"File {filename} sent to {username}: {message}")
                             else:
@@ -609,7 +625,7 @@ class TCPServer:
                         cmd_parts = command.split()
                         if len(cmd_parts) == 2:
                             _, folder_name = cmd_parts
-                            success, message = self.send_folder_to_client(conn, folder_name, session_info)
+                            success, message = self.send_folder_to_client(conn, folder_name, session_info, addr[0])
                             if success:
                                 logging.info(f"Folder {folder_name} sent to {username}: {message}")
                             else:
@@ -709,31 +725,25 @@ class TCPServer:
                             else:
                                 error_response = {"status": "error", "message": "Invalid RENAME_FOLDER command format"}
                                 self._send_json_response(conn, error_response, session_info)
-                    
                     elif command == 'QUIT':
                         goodbye_response = {"status": "ok", "message": "GOODBYE"}
                         self._send_json_response(conn, goodbye_response, session_info)
                         break
-                    
                     else:
                         error_response = {"status": "error", "message": "Unknown command"}
                         self._send_json_response(conn, error_response, session_info)
-                        
                 except socket.timeout:
                     continue
                 except Exception as e:
                     logging.error(f"Command processing error: {e}")
-                    break
-                    
+                    break   
         except Exception as e:
             logging.error(f"Connection error with {client_id}: {e}")
-            
         finally:
             if username:
                 logging.info(f"Connection with {username} ({client_id}) closed")
             else:
                 logging.info(f"Connection with {client_id} closed")
-            
             if client_id in self.clients:
                 self.clients.remove(client_id)
             conn.close()
@@ -756,7 +766,6 @@ class TCPServer:
             
             logging.info(f"TCP Server started on port {self.port}")
             logging.info(f"Upload directory: {os.path.abspath(UPLOAD_DIR)}")
-            logging.info(f"Loaded {len(self.users)} users")
             
             while self.running:
                 try:
@@ -767,181 +776,23 @@ class TCPServer:
                         daemon=True
                     )
                     client_thread.start()
-                    
                 except KeyboardInterrupt:
+                    self.stop()
                     break
                 except Exception as e:
                     logging.error(f"Accept connection error: {e}")
-                    
         except Exception as e:
             logging.error(f"Server start error: {e}")
         finally:
             self.stop()
     
     def stop(self):
-        """Останавливает сервер"""
         self.running = False
         if self.server_socket:
             self.server_socket.close()
         logging.info("TCP Server stopped")
     
-    def handle_folder_transfer(self, conn, folder_name, file_count, session_info):
-        """Handles folder transfer - creates folder and receives files"""
-        try:
-            # Create unique folder name
-            base_folder_name = folder_name
-            counter = 1
-            while os.path.exists(os.path.join(UPLOAD_DIR, folder_name)):
-                folder_name = f"{base_folder_name}_{counter}"
-                counter += 1
-            
-            # Create the folder
-            folder_path = os.path.join(UPLOAD_DIR, folder_name)
-            os.makedirs(folder_path, exist_ok=True)
-            
-            folder_ready_response = {"status": "ok", "command": "FOLDER_READY"}
-            self._send_json_response(conn, folder_ready_response, session_info)
-            logging.info(f"Ready to receive folder '{folder_name}' with {file_count} files")
-            
-            files_received = 0
-            
-            while files_received < int(file_count):
-                # Receive next command (encrypted JSON)
-                try:
-                    encrypted_data_b64 = conn.recv(4096).decode().strip()
-                    if not encrypted_data_b64:
-                        break
-                    
-                    # Decode from base64
-                    encrypted_data = base64.b64decode(encrypted_data_b64)
-                    
-                    # Decrypt JSON packet
-                    if session_info and 'aesgcm' in session_info:
-                        session_id = session_info['session_id']
-                        aesgcm = session_info['aesgcm']
-                        
-                        if len(encrypted_data) < 4 + 12:
-                            error_response = {"status": "error", "message": "Invalid encrypted data"}
-                            self._send_json_response(conn, error_response, session_info)
-                            continue
-                        
-                        pkt_session = encrypted_data[:4]
-                        if pkt_session != session_id:
-                            error_response = {"status": "error", "message": "Session mismatch"}
-                            self._send_json_response(conn, error_response, session_info)
-                            continue
-                        
-                        nonce = encrypted_data[4:16]
-                        ciphertext = encrypted_data[16:]
-                        
-                        try:
-                            json_str = aesgcm.decrypt(nonce, ciphertext, None).decode('utf-8')
-                        except Exception as e:
-                            logging.error(f"Decryption error in folder transfer: {e}")
-                            error_response = {"status": "error", "message": "Decryption failed"}
-                            self._send_json_response(conn, error_response, session_info)
-                            continue
-                    else:
-                        json_str = encrypted_data.decode('utf-8')
-                    
-                    # Parse JSON
-                    json_packet = json.loads(json_str)
-                    command = json_packet.get('command', '')
-                    
-                except (json.JSONDecodeError, ValueError, base64.binascii.Error) as e:
-                    logging.error(f"Error parsing folder transfer command: {e}")
-                    error_response = {"status": "error", "message": "Invalid command format"}
-                    self._send_json_response(conn, error_response, session_info)
-                    continue
-                
-                if command.startswith('REL_FILE'):
-                    # Format: REL_FILE <relative_path> <size> <checksum>
-                    parts = command.split()
-                    if len(parts) == 4:
-                        _, rel_path, size, checksum = parts
-                        
-                        # Create subdirectories if needed
-                        full_path = os.path.join(folder_path, rel_path)
-                        file_dir = os.path.dirname(full_path)
-                        if file_dir:
-                            os.makedirs(file_dir, exist_ok=True)
-                        
-                        # Receive the file
-                        success, message = self.receive_file_to_path(conn, full_path, size, checksum, session_info)
-                        
-                        if success:
-                            files_received += 1
-                            file_ok_response = {"status": "ok", "command": "FILE_OK", "checksum": checksum}
-                            self._send_json_response(conn, file_ok_response, session_info)
-                            logging.info(f"Received file {files_received}/{file_count}: {rel_path}")
-                        else:
-                            file_fail_response = {"status": "error", "command": "FILE_FAIL", "message": message}
-                            self._send_json_response(conn, file_fail_response, session_info)
-                            return False, f"File {rel_path} failed"
-                    else:
-                        error_response = {"status": "error", "message": "Invalid REL_FILE command"}
-                        self._send_json_response(conn, error_response, session_info)
-                        return False, "Invalid command"
-                
-                elif command.startswith('FOLDER_END'):
-                    # Folder transfer complete
-                    break
-                
-                else:
-                    error_response = {"status": "error", "message": "Unknown command"}
-                    self._send_json_response(conn, error_response, session_info)
-                    return False, "Unknown command"
-            
-            # Send completion
-            folder_complete_response = {
-                "status": "ok", 
-                "command": "FOLDER_COMPLETE", 
-                "files_received": files_received
-            }
-            self._send_json_response(conn, folder_complete_response, session_info)
-            return True, f"Folder '{folder_name}' received: {files_received} files"
-            
-        except Exception as e:
-            logging.error(f"Folder receive error: {e}")
-            return False, str(e)
-
-    def receive_file_to_path(self, conn, file_path, expected_size, expected_checksum, session_info):
-        """Receives a file and saves to specific path"""
-        try:
-            ready_response = {"status": "ok", "command": "READY"}
-            self._send_json_response(conn, ready_response, session_info)
-            
-            # Receive data
-            received_data = b''
-            bytes_received = 0
-            chunk_size = 4096
-            
-            while bytes_received < int(expected_size):
-                remaining = int(expected_size) - bytes_received
-                chunk = conn.recv(min(chunk_size, remaining))
-                if not chunk:
-                    break
-                received_data += chunk
-                bytes_received += len(chunk)
-            
-            # Check integrity
-            actual_checksum = hashlib.sha256(received_data).hexdigest()
-            
-            if actual_checksum == expected_checksum:
-                # Save file to specific path
-                with open(file_path, 'wb') as f:
-                    f.write(received_data)
-                return True, f"File saved to {file_path}"
-            else:
-                logging.error(f"Checksum mismatch for {file_path}")
-                return False, "Checksum mismatch"
-                
-        except Exception as e:
-            logging.error(f"Error receiving file {file_path}: {e}")
-            return False, str(e)
-    
     def list_files(self, conn, session_info):
-        """Lists all files and folders in the uploads directory"""
         try:
             files_list = []
             folders_list = []
@@ -951,11 +802,8 @@ class TCPServer:
                 self._send_json_response(conn, empty_response, session_info)
                 return True, "Upload directory is empty"
             
-            # Scan for files and folders
             for item in os.listdir(UPLOAD_DIR):
                 item_path = os.path.join(UPLOAD_DIR, item)
-                
-                # Skip metadata files
                 if item.endswith('.meta') or item.endswith('.corrupted'):
                     continue
                 
@@ -967,7 +815,6 @@ class TCPServer:
                         'size': file_size
                     })
                 elif os.path.isdir(item_path):
-                    # Count files in folder
                     file_count = sum(1 for root, dirs, files in os.walk(item_path) 
                                    for f in files if not f.endswith('.meta'))
                     folders_list.append({
@@ -975,237 +822,193 @@ class TCPServer:
                         'type': 'folder',
                         'file_count': file_count
                     })
-            
-            # Send list
             list_data = {
                 'files': files_list,
                 'folders': folders_list
             }
             
-            # Gửi danh sách file dưới dạng JSON mã hóa
             list_response = {"status": "ok", "command": "LIST_OK", "data": list_data}
             self._send_json_response(conn, list_response, session_info)
-            
             return True, f"List sent: {len(files_list)} files, {len(folders_list)} folders"
-                
         except Exception as e:
             logging.error(f"List files error: {e}")
             return False, str(e)
-    
-    def send_file_to_client(self, conn, filename, session_info):
-        """Sends a file to the client"""
+        
+    def _zip_folder(self, folder_path):
         try:
-            file_path = os.path.join(UPLOAD_DIR, filename)
+            temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+            temp_zip.close()
             
-            if not os.path.exists(file_path):
-                file_error_response = {"status": "error", "command": "FILE_NOT_FOUND"}
-                self._send_json_response(conn, file_error_response, session_info)
-                return False, f"File not found: {filename}"
-            
-            if not os.path.isfile(file_path):
-                file_error_response = {"status": "error", "command": "NOT_A_FILE"}
-                self._send_json_response(conn, file_error_response, session_info)
-                return False, f"Not a file: {filename}"
-            
-            file_size = os.path.getsize(file_path)
-            
-            # Calculate checksum
-            logging.info(f"Calculating checksum for {filename}...")
-            file_hash = hashlib.sha256()
-            with open(file_path, 'rb') as f:
-                while chunk := f.read(8192):
-                    file_hash.update(chunk)
-            checksum = file_hash.hexdigest()
-            
-            # Send file info: FILE_INFO <filename> <size> <checksum>
-            file_info_response = {
-                "status": "ok", 
-                "command": "FILE_INFO", 
-                "filename": filename, 
-                "size": file_size, 
-                "checksum": checksum
-            }
-            self._send_json_response(conn, file_info_response, session_info)
-            
-            # Wait for READY_UDP with client UDP port from client
-            # Client sẽ gửi: {"command": "READY_UDP", "port": client_udp_port}
-            # Nhưng nhìn code cũ, client gửi "READY_UDP <port>"
-            # Ta cần chuyển sang nhận JSON response từ client
-            # Tạm để như cũ vì client vẫn có thể gửi plain text READY_UDP
-            response = conn.recv(1024).decode().strip()
-            if not response.startswith('READY_UDP'):
-                return False, f"Client not ready: {response}"
-            try:
-                client_udp_port = int(response.split()[1])
-            except Exception:
-                return False, f"Invalid READY_UDP response: {response}"
-            
-            client_ip = conn.getpeername()[0]
-            aesgcm = session_info['aesgcm']
-            session_id = session_info['session_id']
-            tx_prefix = session_info.setdefault('server_nonce_prefix', os.urandom(4))
-            session_info.setdefault('server_tx_counter', 0)
-
-            def next_nonce():
-                counter = session_info['server_tx_counter']
-                session_info['server_tx_counter'] = counter + 1
-                return tx_prefix + counter.to_bytes(8, 'big')
-            
-            logging.info(f"Sending file {filename} via UDP/AES to {client_ip}:{client_udp_port}")
-            bytes_sent = 0
-
-            with open(file_path, 'rb') as f:
-                while bytes_sent < file_size:
-                    # UDP must stay small to avoid fragmentation / WinError 10040
-                    chunk = f.read(UDP_PLAINTEXT_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    nonce = next_nonce()
-                    ciphertext = aesgcm.encrypt(nonce, chunk, None)
-                    packet = session_id + nonce + ciphertext
-                    self.udp_socket.sendto(packet, (client_ip, client_udp_port))
-                    bytes_sent += len(chunk)
-            
-            # Wait for confirmation
-            result = conn.recv(1024).decode().strip()
-            if result.startswith('FILE_RECEIVED'):
-                return True, f"File sent: {bytes_sent:,} bytes"
-            else:
-                return False, f"Transfer failed: {result}"
-                
+            folder_name = os.path.basename(folder_path.rstrip('/\\'))
+            with zipfile.ZipFile(temp_zip.name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(folder_path):
+                    for d in dirs:
+                        dir_path = os.path.join(root, d)
+                        arcname = os.path.relpath(dir_path, folder_path) + '/'
+                        zipf.writestr(arcname, '') 
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, folder_path)
+                        zipf.write(file_path, arcname)
+            return temp_zip.name
         except Exception as e:
-            logging.error(f"Send file error: {e}")
+            logging.error(f"Zip folder error: {e}")
+            return None
+        
+    def _send_zip_to_client(self, zip_path, client_addr, session_info):
+        try:
+            with open(zip_path, 'rb') as f:
+                zip_data = f.read()
+            
+            zip_size = len(zip_data)
+            chunk_size = UDP_PLAINTEXT_CHUNK_SIZE
+            chunks = [zip_data[i:i+chunk_size] for i in range(0, zip_size, chunk_size)]
+            total_chunks = len(chunks)
+        
+            if 'download_nonce_prefix' not in session_info:
+                session_info['download_nonce_prefix'] = os.urandom(4)
+                session_info['download_nonce_counter'] = 0
+            
+            def next_nonce():
+                nonce_prefix = session_info['download_nonce_prefix']
+                nonce_counter = session_info['download_nonce_counter']
+                nonce = nonce_prefix + nonce_counter.to_bytes(8, 'big')
+                session_info['download_nonce_counter'] = nonce_counter + 1
+                return nonce
+            
+            WINDOW_SIZE = 64
+            TIMEOUT = 0.5
+            base = 0
+            next_seq = 0
+            acked = [False] * total_chunks
+            last_ack_time = time.time()
+            start_time = time.time()
+            
+            while next_seq < min(base + WINDOW_SIZE, total_chunks):
+                nonce = next_nonce()
+                ciphertext = session_info['aesgcm'].encrypt(nonce, chunks[next_seq], None)
+                header = session_info['session_id'] + next_seq.to_bytes(4, 'big')
+                packet = header + nonce + ciphertext
+                self.udp_socket.sendto(packet, client_addr)
+                next_seq += 1
+            
+            while base < total_chunks:
+                try:
+                    self.udp_socket.settimeout(TIMEOUT)
+                    ack_packet, addr = self.udp_socket.recvfrom(1024)
+                    if addr[0] != client_addr[0]:
+                        continue
+                    
+                    ack_data = ack_packet.decode(errors='ignore')
+                    if ack_data.startswith('ACK '):
+                        ack_seq = int(ack_data.split()[1])
+                        
+                        for seq in range(base, ack_seq + 1):
+                            if seq < total_chunks:
+                                acked[seq] = True
+                        
+                        while base < total_chunks and acked[base]:
+                            base += 1
+                        
+                        while next_seq < min(base + WINDOW_SIZE, total_chunks):
+                            nonce = next_nonce()
+                            ciphertext = session_info['aesgcm'].encrypt(nonce, chunks[next_seq], None)
+                            header = session_info['session_id'] + next_seq.to_bytes(4, 'big')
+                            packet = header + nonce + ciphertext
+                            self.udp_socket.sendto(packet, client_addr)
+                            next_seq += 1
+                        
+                        last_ack_time = time.time()
+                except socket.timeout:
+                    if time.time() - last_ack_time > TIMEOUT * 3:
+                        next_seq = base
+                        for seq in range(base, min(base + WINDOW_SIZE, total_chunks)):
+                            if seq < total_chunks:
+                                nonce = next_nonce()
+                                ciphertext = session_info['aesgcm'].encrypt(nonce, chunks[seq], None)
+                                header = session_info['session_id'] + seq.to_bytes(4, 'big')
+                                packet = header + nonce + ciphertext
+                                self.udp_socket.sendto(packet, client_addr)
+                        last_ack_time = time.time()
+                    continue
+            
+            end_header = session_info['session_id'] + (0xFFFFFFFF).to_bytes(4, 'big')
+            self.udp_socket.sendto(end_header + b'END', client_addr)
+            
+            transfer_time = time.time() - start_time
+            speed = zip_size / transfer_time / 1024 if transfer_time > 0 else 0
+            return True, f"ZIP file sent: {speed:.2f} KB/s"
+        except Exception as e:
+            logging.error(f"Error sending ZIP file: {e}")
             return False, str(e)
-    
-    def send_folder_to_client(self, conn, folder_name, session_info):
-        """Sends a folder to the client"""
+
+    def send_folder_to_client(self, conn, folder_name, session_info, client_ip):
         try:
             folder_path = os.path.join(UPLOAD_DIR, folder_name)
             
             if not os.path.exists(folder_path):
-                folder_error_response = {"status": "error", "command": "FOLDER_NOT_FOUND"}
-                self._send_json_response(conn, folder_error_response, session_info)
                 return False, f"Folder not found: {folder_name}"
-            
             if not os.path.isdir(folder_path):
-                folder_error_response = {"status": "error", "command": "NOT_A_FOLDER"}
-                self._send_json_response(conn, folder_error_response, session_info)
                 return False, f"Not a folder: {folder_name}"
+        
+            zip_path = self._zip_folder(folder_path)
+            if not zip_path:
+                return False, "Failed to zip folder"
             
-            # Get all files recursively
-            all_files = []
-            for root, dirs, files in os.walk(folder_path):
-                for file in files:
-                    # Skip metadata files
-                    if file.endswith('.meta') or file.endswith('.corrupted'):
-                        continue
-                    full_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(full_path, folder_path)
-                    all_files.append((full_path, rel_path))
-            
-            if not all_files:
-                folder_empty_response = {"status": "ok", "command": "FOLDER_EMPTY"}
-                self._send_json_response(conn, folder_empty_response, session_info)
-                return False, "Folder is empty"
-            
-            # Send folder info: FOLDER_INFO <folder_name> <file_count>
+            zip_size = os.path.getsize(zip_path)
+            zip_checksum = hashlib.sha256()
+            with open(zip_path, 'rb') as f:
+                while chunk := f.read(8192):
+                    zip_checksum.update(chunk)
+            checksum_hex = zip_checksum.hexdigest()
+        
             folder_info_response = {
                 "status": "ok", 
-                "command": "FOLDER_INFO", 
-                "folder_name": folder_name, 
-                "file_count": len(all_files)
+                "command": "DOWNLOAD_READY", 
+                "filename": f"{folder_name}.zip",
+                "size": zip_size,
+                "checksum": checksum_hex
             }
             self._send_json_response(conn, folder_info_response, session_info)
             
-            # Wait for READY
-            response = conn.recv(1024).decode().strip()
-            if response != 'FOLDER_READY':
-                return False, f"Client not ready: {response}"
+            try:
+                udp_port_msg = conn.recv(1024).decode().strip()
+                if udp_port_msg.startswith('UDP_PORT'):
+                    client_udp_port = int(udp_port_msg.split()[1])
+                    client_udp_addr = (client_ip, client_udp_port)
+                    logging.info(f"Client UDP port for folder: {client_udp_port}")
+                else:
+                    os.remove(zip_path)
+                    return False, "Client UDP port not received"
+            except Exception as e:
+                os.remove(zip_path)
+                logging.error(f"Failed to get client UDP port: {e}")
+                return False, "Failed to get client UDP port"
             
-            # Send each file
-            files_sent = 0
-            total_size = 0
+            success, message = self._send_zip_to_client(zip_path, client_udp_addr, session_info)
+            os.remove(zip_path)
             
-            for full_path, rel_path in all_files:
-                try:
-                    file_size = os.path.getsize(full_path)
-                    
-                    # Calculate checksum
-                    file_hash = hashlib.sha256()
-                    with open(full_path, 'rb') as f:
-                        while chunk := f.read(8192):
-                            file_hash.update(chunk)
-                    checksum = file_hash.hexdigest()
-                    
-                    # Send file info: REL_FILE_INFO <relative_path> <size> <checksum>
-                    file_info_response = {
-                        "status": "ok", 
-                        "command": "REL_FILE_INFO", 
-                        "rel_path": rel_path, 
-                        "size": file_size, 
-                        "checksum": checksum
-                    }
-                    self._send_json_response(conn, file_info_response, session_info)
-                    
-                    # Wait for READY - client sẽ gửi JSON response
-                    response = conn.recv(1024).decode().strip()
-                    if response != 'READY':
-                        return False, f"Client not ready for {rel_path}: {response}"
-                    
-                    # Send file data
-                    bytes_sent = 0
-                    with open(full_path, 'rb') as f:
-                        while bytes_sent < file_size:
-                            chunk = f.read(65536)
-                            if not chunk:
-                                break
-                            conn.sendall(chunk)
-                            bytes_sent += len(chunk)
-                    
-                    # Wait for confirmation
-                    result = conn.recv(1024).decode().strip()
-                    if result.startswith('FILE_RECEIVED'):
-                        files_sent += 1
-                        total_size += file_size
-                        logging.info(f"Sent file {files_sent}/{len(all_files)}: {rel_path}")
-                    else:
-                        return False, f"File transfer failed: {rel_path} - {result}"
-                        
-                except Exception as e:
-                    logging.error(f"Error sending file {rel_path}: {e}")
-                    return False, f"Error sending {rel_path}: {e}"
-            
-            # Send folder completion
-            folder_complete_response = {
-                "status": "ok", 
-                "command": "FOLDER_COMPLETE", 
-                "files_sent": files_sent
-            }
-            self._send_json_response(conn, folder_complete_response, session_info)
-            
-            # Wait for final confirmation
-            final_response = conn.recv(1024).decode().strip()
-            if final_response.startswith('FOLDER_RECEIVED'):
-                return True, f"Folder sent: {files_sent} files, {total_size:,} bytes"
+            if success:
+                complete_response = {"status": "ok", "command": "FOLDER_OK", "message": message}
+                self._send_json_response(conn, complete_response, session_info)
+                return True, message
             else:
-                return False, f"Folder transfer incomplete: {final_response}"
-                
+                return False, message
         except Exception as e:
             logging.error(f"Send folder error: {e}")
+            if 'zip_path' in locals() and os.path.exists(zip_path):
+                os.remove(zip_path)
             return False, str(e)
     
     def delete_file(self, filename):
-        """Deletes a file from the uploads directory"""
         try:
             file_path = os.path.join(UPLOAD_DIR, filename)
             
             if not os.path.exists(file_path):
                 return False, f"File not found: {filename}"
-            
             if not os.path.isfile(file_path):
                 return False, f"Not a file: {filename}"
             
-            # Also delete metadata file if exists
             meta_path = file_path + '.meta'
             if os.path.exists(meta_path):
                 os.remove(meta_path)
@@ -1213,50 +1016,40 @@ class TCPServer:
             os.remove(file_path)
             logging.info(f"File deleted: {filename}")
             return True, f"File deleted: {filename}"
-            
         except Exception as e:
             logging.error(f"Delete file error: {e}")
             return False, str(e)
     
     def delete_folder(self, folder_name):
-        """Deletes a folder from the uploads directory"""
         try:
             folder_path = os.path.join(UPLOAD_DIR, folder_name)
             
             if not os.path.exists(folder_path):
                 return False, f"Folder not found: {folder_name}"
-            
             if not os.path.isdir(folder_path):
                 return False, f"Not a folder: {folder_name}"
             
-            # Use shutil to remove directory tree
             shutil.rmtree(folder_path)
             logging.info(f"Folder deleted: {folder_name}")
             return True, f"Folder deleted: {folder_name}"
-            
         except Exception as e:
             logging.error(f"Delete folder error: {e}")
             return False, str(e)
     
     def rename_file(self, old_name, new_name):
-        """Renames a file in the uploads directory"""
         try:
             old_path = os.path.join(UPLOAD_DIR, old_name)
             new_path = os.path.join(UPLOAD_DIR, new_name)
             
             if not os.path.exists(old_path):
                 return False, f"File not found: {old_name}"
-            
             if not os.path.isfile(old_path):
                 return False, f"Not a file: {old_name}"
-            
             if os.path.exists(new_path):
                 return False, f"File already exists: {new_name}"
             
-            # Rename file
             os.rename(old_path, new_path)
             
-            # Rename metadata file if exists
             old_meta = old_path + '.meta'
             new_meta = new_path + '.meta'
             if os.path.exists(old_meta):
@@ -1264,32 +1057,25 @@ class TCPServer:
             
             logging.info(f"File renamed: {old_name} -> {new_name}")
             return True, f"File renamed: {old_name} -> {new_name}"
-            
         except Exception as e:
             logging.error(f"Rename file error: {e}")
             return False, str(e)
     
     def rename_folder(self, old_name, new_name):
-        """Renames a folder in the uploads directory"""
         try:
             old_path = os.path.join(UPLOAD_DIR, old_name)
             new_path = os.path.join(UPLOAD_DIR, new_name)
             
             if not os.path.exists(old_path):
                 return False, f"Folder not found: {old_name}"
-            
             if not os.path.isdir(old_path):
                 return False, f"Not a folder: {old_name}"
-            
             if os.path.exists(new_path):
                 return False, f"Folder already exists: {new_name}"
             
-            # Rename folder
             os.rename(old_path, new_path)
-            
             logging.info(f"Folder renamed: {old_name} -> {new_name}")
             return True, f"Folder renamed: {old_name} -> {new_name}"
-            
         except Exception as e:
             logging.error(f"Rename folder error: {e}")
             return False, str(e)

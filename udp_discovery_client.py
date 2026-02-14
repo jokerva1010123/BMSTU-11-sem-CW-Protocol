@@ -29,7 +29,7 @@ class UDPDiscoveryClient:
             self.sock.settimeout(self.timeout)
             
             discovery_msg = "LFTP_DISCOVERY"
-            broadcast_addr = ('192.168.0.255', UDP_PORT)
+            broadcast_addr = ('255.255.255.255', UDP_PORT)
             
             logging.info("Sending broadcast request...")
             self.sock.sendto(discovery_msg.encode(), broadcast_addr)

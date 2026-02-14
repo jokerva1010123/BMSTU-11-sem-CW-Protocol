@@ -16,14 +16,14 @@ def test_send_file_multiple_sizes(server_ip, server_port=TCP_PORT, username="use
     # File sizes to test
     file_sizes = [
         # 1024*1024,         # 1MB
-        # 10 * 1024 * 1024  # 10MB
+        10 * 1024 * 1024  # 10MB
         # 50 * 1024 * 1024  # 50MB
         # 100 * 1024 * 1024 # 100MB
         # 200 * 1024 * 1024  # 200MB
         # 500 * 1024 * 1024  # 500MB
         # 1000 * 1024 * 1024  # 1GB
         # 2000 * 1024 * 1024  # 2GB
-        5000 * 1024 * 1024  # 5GB
+        # 5000 * 1024 * 1024  # 5GB
     ]
 
     results = []
@@ -53,15 +53,6 @@ def test_send_file_multiple_sizes(server_ip, server_port=TCP_PORT, username="use
             test_file = f"test_file_{size//1024}KB.txt"
             print(f"Sending test file: {test_file} ({size} bytes)")
 
-            # with open(test_file, 'w') as f:
-            #     # Use simple repeating content instead of random for faster creation
-            #     content = "A" * 1024  # 1KB block
-            #     remaining = size
-            #     while remaining > 0:
-            #         chunk = min(len(content), remaining)
-            #         f.write(content[:chunk])
-            #         remaining -= chunk
-
             # Send file and measure time
             print(f"Sending {test_file}...")
             start_time = time.time()
@@ -77,12 +68,9 @@ def test_send_file_multiple_sizes(server_ip, server_port=TCP_PORT, username="use
                     'time': duration,
                     'size_bytes': size
                 })
+                print(results)
             else:
                 print(f"Failed to send file: {message}")
-
-            # Clean up file
-            # if os.path.exists(test_file):
-            #     os.remove(test_file)
 
         # Disconnect
         client.disconnect()
